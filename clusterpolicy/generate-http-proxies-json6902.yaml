@@ -1,0 +1,30 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-http-proxies-json6902
+spec:
+  background: true
+  rules:
+    - name: generate-http-proxies
+      match:
+        resources:
+          kinds: ["HTTPProxy"]
+      exclude:
+        resources:
+          names: ["proxy-to-listener"]
+          namespaces: ["argocd"]
+      mutate:
+        targets:
+          - apiVersion: projectcontour.io/v1
+            kind: HTTPProxy
+            namespace: argocd
+            name: proxy-to-listener
+        patchesJson6902: |-
+          - op: add
+            path: /spec/includes/-
+            value:
+              name: "{{ request.object.metadata.name }}"
+              namespace: "{{ request.object.metadata.namespace }}"
+              conditions:
+                - prefix: "/{{ request.object.metadata.namespace }}"

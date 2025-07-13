@@ -1,0 +1,231 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-triggers
+spec:
+  generateExisting: true
+  background: true
+  rules:
+    - name: generate-tekton-git-binding-rule
+      match:
+        resources:
+          kinds: ["Workload"]
+      generate:
+        apiVersion: triggers.tekton.dev/v1beta1
+        kind: TriggerBinding
+        name: git-binding
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        data:
+          apiVersion: triggers.tekton.dev/v1beta1
+          kind: TriggerBinding
+          metadata:
+            name: git-binding
+            namespace: "{{ request.object.metadata.namespace }}"
+          spec:
+            params:
+              - name: ci-git-revision
+                value: '\$(body.checkout_sha)'
+              - name: ci-git-branch
+                value: '\$(body.ref)'
+              - name: ci-git-url
+                value: '\$(body.project.git_http_url)'
+              - name: ci-git-repo-path
+                value: '\$(body.project.path_with_namespace)'
+              - name: ci-git-project-name
+                value: '\$(body.project.name)'
+
+    - name: generate-master-pipeline-template-rule
+      match:
+        resources:
+          kinds: ["Workload"]
+      generate:
+        apiVersion: triggers.tekton.dev/v1beta1
+        kind: TriggerTemplate
+        name: master-pipeline-template
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        data:
+          apiVersion: triggers.tekton.dev/v1beta1
+          kind: TriggerTemplate
+          metadata:
+            name: master-pipeline-template
+            namespace: "{{ request.object.metadata.namespace }}"
+          spec:
+            params:
+              - name: ci-git-revision
+              - name: ci-git-branch
+              - name: ci-git-url
+              - name: ci-git-repo-path
+              - name: ci-git-project-name
+              - name: ci-skip-mr
+                default: "{{ request.object.spec.params[?(@.name=='ci-skip-mr')].value | [0] }}"
+              - name: gitops_server_address
+                default: "{{ request.object.spec.params[?(@.name=='gitops_server_address')].value | [0] }}"
+              - name: gitops_branch
+                default: "{{ request.object.spec.params[?(@.name=='gitops_branch')].value | [0] }}"
+              - name: gitops_repository_name
+                default: "{{ request.object.spec.params[?(@.name=='gitops_repository_name')].value | [0] }}"
+              - name: gitops_repository_owner
+                default: "{{ request.object.spec.params[?(@.name=='gitops_repository_owner')].value | [0] }}"
+              - name: gitops_user_email
+                default: "{{ request.object.spec.params[?(@.name=='gitops_user_email')].value | [0] }}"
+              - name: gitops_commit_message
+                default: "{{ request.object.spec.params[?(@.name=='gitops_commit_message')].value | [0] }}"
+              - name: gitops_ssh_secret
+                default: "{{ request.object.spec.params[?(@.name=='gitops_ssh_secret')].value | [0] }}"
+              - name: gitops_commit_branch
+                default: "{{ request.object.spec.params[?(@.name=='gitops_commit_branch')].value | [0] }}"
+              - name: gitops_server_kind
+                default: "{{ request.object.spec.params[?(@.name=='gitops_server_kind')].value | [0] }}"
+              - name: gitops_pull_request_title
+                default: "{{ request.object.spec.params[?(@.name=='gitops_pull_request_title')].value | [0] }}"
+              - name: gitops_pull_request_body
+                default: "{{ request.object.spec.params[?(@.name=='gitops_pull_request_body')].value | [0] }}"
+              - name: workloadname
+                default: "{{ request.object.metadata.name }}"
+              - name: image_repo_address
+                default: "{{ request.object.spec.params[?(@.name=='image_repo_address')].value | [0] }}"
+              - name: image_repo_path
+                default: "{{ request.object.spec.params[?(@.name=='image_repo_path')].value | [0] }}"
+              - name: ingressclassname
+                default: "{{ request.object.spec.params[?(@.name=='ingressclassname')].value | [0] }}"
+              - name: dockerfile
+                default: "{{ request.object.spec.params[?(@.name=='dockerfile')].value | [0] }}"
+              - name: submodules
+                default: "{{ request.object.spec.params[?(@.name=='submodules')].value | [0] }}"
+              - name: domain
+                default: >-
+                  {{ request.object.spec.params[?(@.name=='domain')].value | [0] }}
+              - name: clusterBuilder
+                default: >-
+                  {{ request.object.spec.params[?(@.name=='clusterBuilder')].value | [0] }}
+              - name: buildServiceBindings
+                description: JSON array of all service bindings
+                default: >-
+                  {{ request.object.spec.params[?(@.name=='buildServiceBindings')].value | [0] }}
+              - name: build_workspace_claim
+                default: "{{ request.object.metadata.annotations.\"tekton.platform/build_workspace_claim\" | 'shared-data' }}"
+              - name: build_git_secret
+                default: "{{ request.object.metadata.annotations.\"tekton.platform/build_git_secret\" | 'git-credentials' }}"
+            resourcetemplates:
+              - apiVersion: tekton.dev/v1
+                kind: PipelineRun
+                metadata:
+                  generateName: master-pipeline-run-
+                  namespace: "{{ request.object.spec.params[?(@.name=='targetNamespace')].value | [0] }}"
+                spec:
+                  taskRunTemplate:
+                    podTemplate:
+                      securityContext:
+                        runAsUser: 0
+                        fsGroup: 0
+                    serviceAccountName: pipeline
+                  pipelineRef:
+                    name: master-ci-pipeline
+                  params:
+                    - name: buildServiceBindings
+                      value: '\$(tt.params.buildServiceBindings)'
+                    - name: ci-git-revision
+                      value: '\$(tt.params.ci-git-revision)'
+                    - name: ci-git-branch
+                      value: '\$(tt.params.ci-git-branch)'
+                    - name: ci-git-url
+                      value: '\$(tt.params.ci-git-url)'
+                    - name: ci-git-repo-path
+                      value: '\$(tt.params.ci-git-repo-path)'
+                    - name: ci-git-project-name
+                      value: '\$(tt.params.ci-git-project-name)'
+                    - name: ci-skip-mr
+                      value: '\$(tt.params.ci-skip-mr)'
+                    - name: gitops_server_address
+                      value: '\$(tt.params.gitops_server_address)'
+                    - name: gitops_branch
+                      value: '\$(tt.params.gitops_branch)'
+                    - name: gitops_repository_name
+                      value: '\$(tt.params.gitops_repository_name)'
+                    - name: gitops_repository_owner
+                      value: '\$(tt.params.gitops_repository_owner)'
+                    - name: gitops_user_email
+                      value: '\$(tt.params.gitops_user_email)'
+                    - name: gitops_commit_message
+                      value: '\$(tt.params.gitops_commit_message)'
+                    - name: gitops_ssh_secret
+                      value: '\$(tt.params.gitops_ssh_secret)'
+                    - name: gitops_commit_branch
+                      value: '\$(tt.params.gitops_commit_branch)'
+                    - name: gitops_server_kind
+                      value: '\$(tt.params.gitops_server_kind)'
+                    - name: gitops_pull_request_title
+                      value: '\$(tt.params.gitops_pull_request_title)'
+                    - name: gitops_pull_request_body
+                      value: '\$(tt.params.gitops_pull_request_body)'
+                    - name: workloadname
+                      value: '\$(tt.params.workloadname)'
+                    - name: image_repo_address
+                      value: '\$(tt.params.image_repo_address)'
+                    - name: image_repo_path
+                      value: '\$(tt.params.image_repo_path)'
+                    - name: ingressclassname
+                      value: '\$(tt.params.ingressclassname)'
+                    - name: dockerfile
+                      value: '\$(tt.params.dockerfile)'
+                    - name: submodules
+                      value: '\$(tt.params.submodules)'
+                    - name: domain
+                      value: '\$(tt.params.domain)'
+                    - name: clusterBuilder
+                      value: '\$(tt.params.clusterBuilder)'
+                    - name: build_workspace_claim
+                      value: '\$(tt.params.build_workspace_claim)'
+                    - name: build_git_secret
+                      value: '\$(tt.params.build_git_secret)'
+                    - name: SKIP_TLS_VERIFY
+                      value: "false"
+                  workspaces:
+                    - name: shared-data
+                      persistentVolumeClaim:
+                        claimName: '\$(params.build_workspace_claim)'
+                    - name: git-credentials
+                      secret:
+                        secretName: '\$(params.build_git_secret)'
+                    - name: settings-xml
+                      secret:
+                        secretName: '\$(params.buildServiceBindings)'
+
+    - name: generate-simple-listener
+      match:
+        resources:
+          kinds: ["Namespace"]
+          selector:
+            matchLabels:
+              tekton-enabled: "true"
+      generate:
+        apiVersion: triggers.tekton.dev/v1beta1
+        kind: EventListener
+        name: simple-listener
+        namespace: "{{ request.object.metadata.name }}"
+        synchronize: true
+        data:
+          apiVersion: triggers.tekton.dev/v1beta1
+          kind: EventListener
+          metadata:
+            name: simple-listener
+            namespace: "{{ request.object.metadata.name }}"
+          spec:
+            serviceAccountName: pipeline
+            triggers:
+              - name: git-push-trigger
+                interceptors:
+                  - ref:
+                      name: cel
+                    params:
+                      - name: filter
+                        value: >-
+                          body.ref == 'refs/heads/main' &&
+                          body.object_kind == 'push'
+                bindings:
+                  - ref: git-binding
+                template:
+                  ref: master-pipeline-template

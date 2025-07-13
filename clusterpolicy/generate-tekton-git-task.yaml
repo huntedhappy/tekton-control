@@ -1,0 +1,138 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-git-task-policy
+spec:
+  generateExisting: true
+  background: true
+  rules:
+  - name: generate-tekton-git-task-rule
+    match:
+      resources:
+        kinds: ["Namespace"]
+        selector:
+          matchLabels:
+            tekton-enabled: "true"
+    generate:
+      apiVersion: tekton.dev/v1
+      kind: Task
+      name: git-cli
+      namespace: "{{ request.object.metadata.name }}"
+      synchronize: true
+      data:
+        apiVersion: tekton.dev/v1
+        kind: Task
+        metadata:
+          name: git-cli
+          namespace: "{{ request.object.metadata.name }}"
+        spec:
+          description: |
+            Git operations with basic-auth or ssh, plus optional self-signed CA support.
+          workspaces:
+            - name: source
+              description: Git repo가 clone될 워크스페이스
+            - name: basic-auth
+              optional: true
+              description: username/password 파일이 들어 있는 시크릿
+            - name: ssh-directory
+              optional: true
+              description: .ssh 디렉토리 (private key, known_hosts 등)
+            - name: ca-certs
+              optional: true
+              description: self-signed CA 인증서(pem) 파일을 담은 시크릿
+          params:
+            - name: BASE_IMAGE
+              type: string
+              default: cgr.dev/chainguard/git:root-2.39@sha256:7759f87050dd8bacabe61354d75ccd7f864d6b6f8ec42697db7159eccd491139
+            - name: GIT_USER_NAME
+              type: string
+              default: ""
+            - name: GIT_USER_EMAIL
+              type: string
+              default: ""
+            - name: GIT_SCRIPT
+              type: string
+              default: |
+                git help
+            - name: USER_HOME
+              type: string
+              default: "/root"
+            - name: VERBOSE
+              type: string
+              default: "true"
+            - name: SKIP_TLS_VERIFY
+              type: string
+              default: "false"
+              description: "true로 설정 시 https 인증서 검증을 건너뜁니다."
+            - name: CA_CERT_PATH
+              type: string
+              default: "/etc/git/ca.pem"
+              description: "사설 CA를 마운트할 경로 (ca-certs workspace)"
+          results:
+            - name: commit
+              description: 작업 후 최종 SHA
+          steps:
+            - name: setup-credentials
+              image: \$(params.BASE_IMAGE)
+              script: |
+                #!/usr/bin/env sh
+                set -eu
+                if [ "\$(workspaces.basic-auth.bound)" = "true" ]; then
+                  # remote URL에서 호스트만 추출
+                  HOST=$(git remote get-url origin 2>/dev/null | sed -E 's#https?://([^/]+)/.*#\1#')
+                  # 한 줄 echo 로 .git-credentials 생성
+                  echo "https://$(cat \$(workspaces.basic-auth.path)/username):$(cat \$(workspaces.basic-auth.path)/password)@$HOST" \
+                    > "\$(params.USER_HOME)/.git-credentials"
+                  git config --global credential.helper store
+                  chmod 600 "\$(params.USER_HOME)/.git-credentials"
+                fi
+
+            - name: setup-ca
+              image: busybox
+              script: |
+                #!/bin/sh
+                set -eu
+                if [ "\$(workspaces.ca-certs.bound)" = "true" ]; then
+                  # CA 파일을 지정된 경로로 복사
+                  mkdir -p "\$(params.CA_CERT_PATH)"
+                  cp \$(workspaces.ca-certs.path)/* "\$(params.CA_CERT_PATH)"
+                  # Git에 CA 경로 설정
+                  git config --global http.sslCAInfo "\$(params.CA_CERT_PATH)"/*
+                fi
+                if [ "\$(params.SKIP_TLS_VERIFY)" = "true" ]; then
+                  git config --global http.sslVerify false
+                fi
+
+            - name: git
+              image: \$(params.BASE_IMAGE)
+              workingDir: \$(workspaces.source.path)
+              env:
+                - name: HOME
+                  value: \$(params.USER_HOME)
+                - name: PARAM_VERBOSE
+                  value: \$(params.VERBOSE)
+              script: |
+                #!/usr/bin/env sh
+                set -eu
+                [ "${PARAM_VERBOSE}" = "true" ] && set -x
+
+                # ssh-directory가 바인딩된 경우
+                if [ "\$(workspaces.ssh-directory.bound)" = "true" ]; then
+                  cp -R "\$(workspaces.ssh-directory.path)" "${HOME}/.ssh"
+                  chmod 700 "${HOME}/.ssh"
+                  chmod 400 "${HOME}/.ssh/"*
+                fi
+
+                # Git 사용자 정보 설정
+                if [ -n "\$(params.GIT_USER_EMAIL)" ]; then
+                  git config --global user.email "\$(params.GIT_USER_EMAIL)"
+                fi
+                if [ -n "\$(params.GIT_USER_NAME)" ]; then
+                  git config --global user.name "\$(params.GIT_USER_NAME)"
+                fi
+
+                # 실제 git 스크립트 실행
+                eval "\$(params.GIT_SCRIPT)"
+
+                # 결과 커밋 SHA 반환
+                git rev-parse HEAD | tr -d '\n' > "\$(results.commit.path)"

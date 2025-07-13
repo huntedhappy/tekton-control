@@ -1,0 +1,251 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-buildkit-task-policy
+spec:
+  generateExisting: true
+  background: true
+  rules:
+  - name: generate-tekton-buildkit-daemonless-task-rule
+    match:
+      resources:
+        kinds: ["Namespace"]
+        selector:
+          matchLabels:
+            tekton-enabled: "true"
+    generate:
+      apiVersion: tekton.dev/v1
+      kind: Task
+      name: buildkit-daemonless
+      namespace: "{{ request.object.metadata.name }}"
+      synchronize: true
+      data:
+        apiVersion: tekton.dev/v1
+        kind: Task
+        metadata:
+          name: buildkit-daemonless
+          namespace: "{{ request.object.metadata.name }}"
+          labels:
+            app.kubernetes.io/version: "0.1"
+          annotations:
+            tekton.dev/pipelines.minVersion: "0.12.1"
+            tekton.dev/categories: Image Build
+            tekton.dev/tags: image-build
+            tekton.dev/displayName: "buildkit daemonless"
+            tekton.dev/platforms: "linux/amd64"
+            tekton.dev/deprecated: "true"
+        spec:
+          description: >-
+            This Task builds source into a container image using Moby BuildKit.
+
+            This buildkit-daemonless Task is similar to buildkit but does not need
+            creating Secret, Deployment, and Service resources for setting up the
+            buildkitd daemon cluster.
+
+          params:
+          - name: DOCKERFILE
+            description: The name of the Dockerfile
+            default: "Dockerfile"
+          - name: BUILDKIT_IMAGE
+            description: The name of the BuildKit image
+            # The image needs to be rootful because Tekton creates /builder/home/.docker/config.json owned by root:root with 0600
+            # https://github.com/tektoncd/pipeline/issues/852
+            default: "docker.io/moby/buildkit:v0.6.2@sha256:db234cf7362aef489e4273a6937794cb19c09ba15c7ee0ec6f85044086ea4f6a"
+          workspaces:
+          - name: source
+          steps:
+          - name: build-and-push
+            image: \$(params.BUILDKIT_IMAGE)
+            workingDir: \$(workspaces.source.path)
+            securityContext:
+              privileged: true
+            command: ["buildctl-daemonless.sh", "--debug",
+                      "build",
+                      "--progress=plain",
+                      "--frontend=dockerfile.v0",
+                      "--opt", 'filename=\$(params.DOCKERFILE)',
+                      "--local", "context=.", "--local", "dockerfile=.",
+                      "--output", 'type=image,name=\$(resources.outputs.image.url),push=true',
+                      "--export-cache", "type=inline",
+                      "--import-cache", 'type=registry,ref=\$(resources.outputs.image.url)']
+
+  - name: generate-tekton-buildkit-task-rule
+    match:
+      resources:
+        kinds: ["Namespace"]
+        selector:
+          matchLabels:
+            tekton-enabled: "true"
+    generate:
+      apiVersion: tekton.dev/v1
+      kind: Task
+      name: buildkit
+      namespace: "{{ request.object.metadata.name }}"
+      synchronize: true
+      data:
+        apiVersion: tekton.dev/v1
+        kind: Task
+        metadata:
+          name: buildkit
+          namespace: "{{ request.object.metadata.name }}"
+          labels:
+            app.kubernetes.io/version: "0.1"
+          annotations:
+            tekton.dev/pipelines.minVersion: "0.12.1"
+            tekton.dev/categories: Image Build
+            tekton.dev/tags: image-build
+            tekton.dev/platforms: "linux/amd64"
+            tekton.dev/deprecated: "true"
+        spec:
+          description: >-
+            This Task builds source into a container image using Moby BuildKit.
+
+          params:
+          - name: IMAGE
+            description: The full image name to push
+          - name: DOCKERFILE
+            description: Path to the Dockerfile
+            default: "Dockerfile"
+          - name: BUILDKIT_CLIENT_IMAGE
+            description: The name of the BuildKit client (buildctl) image
+            # The image needs to be rootful because Tekton creates /builder/home/.docker/config.json owned by root:root with 0600
+            # https://github.com/tektoncd/pipeline/issues/852
+            default: "docker.io/moby/buildkit:v0.6.2@sha256:db234cf7362aef489e4273a6937794cb19c09ba15c7ee0ec6f85044086ea4f6a"
+          - name: BUILDKIT_DAEMON_ADDRESS
+            description: The address of the BuildKit daemon (buildkitd) service
+            default: "tcp://buildkitd:1234"
+          - name: BUILDKIT_CLIENT_CERTS
+            description: The name of Secret that contains ca.pem, cert.pem, key.pem for mTLS connection to BuildKit daemon
+            default: "buildkit-client-certs"
+          workspaces:
+          - name: source
+          volumes:
+          - name: certs
+            secret:
+              secretName: '\$(params.BUILDKIT_CLIENT_CERTS)'
+          steps:
+          - name: build-and-push
+            image: '\$(params.BUILDKIT_CLIENT_IMAGE)'
+            workingDir: '\$(workspaces.source.path)'
+            volumeMounts:
+            - name: certs
+              readOnly: true
+              mountPath: /certs
+            command: ['buildctl', '--debug',
+                      '--addr=\$(params.BUILDKIT_DAEMON_ADDRESS)',
+                      '--tlscacert', '/certs/ca.pem',
+                      '--tlscert', '/certs/cert.pem',
+                      '--tlskey', '/certs/key.pem',
+                      'build',
+                      '--progress=plain',
+                      '--frontend=dockerfile.v0',
+                      '--opt', 'filename=\$(params.DOCKERFILE)',
+                      '--local', 'context=.', '--local', 'dockerfile=.',
+                      '--output', 'type=image,name=\$(params.IMAGE),push=true',
+                      '--export-cache', 'type=inline',
+                      '--import-cache', 'type=registry,ref=\$(params.IMAGE)']
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-buildkit-deployment-policy
+spec:
+  generateExisting: true
+  background: true
+  rules:
+  - name: generate-tekton-buildkit-deployment-rule
+    match:
+      resources:
+        kinds: ["Namespace"]
+        selector:
+          matchLabels:
+            tekton-enabled: "true"
+    generate:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: buildkitd
+      namespace: "{{ request.object.metadata.name }}"
+      synchronize: true
+      data:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: buildkitd
+          namespace: "{{ request.object.metadata.name }}"
+          labels:
+            app: buildkitd
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: buildkitd
+          template:
+            metadata:
+              labels:
+                app: buildkitd
+            spec:
+              containers:
+              - name: buildkitd
+                image: moby/buildkit:v0.6.2
+                args:
+                - --addr
+                - unix:///run/buildkit/buildkitd.sock
+                - --addr
+                - tcp://0.0.0.0:1234
+                - --tlscacert
+                - /certs/ca.pem
+                - --tlscert
+                - /certs/cert.pem
+                - --tlskey
+                - /certs/key.pem
+                securityContext:
+                  privileged: true
+                ports:
+                - containerPort: 1234
+                volumeMounts:
+                - name: certs
+                  readOnly: true
+                  mountPath: /certs
+              volumes:
+              # buildkit-daemon-certs must contain ca.pem, cert.pem, and key.pem
+              - name: certs
+                secret:
+                  secretName: buildkit-daemon-certs
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-buildkit-service-policy
+spec:
+  generateExisting: true
+  background: true
+  rules:
+  - name: generate-tekton-buildkit-service-rule
+    match:
+      resources:
+        kinds: ["Namespace"]
+        selector:
+          matchLabels:
+            tekton-enabled: "true"
+    generate:
+      apiVersion: v1
+      kind: Service
+      name: buildkitd
+      namespace: "{{ request.object.metadata.name }}"
+      synchronize: true
+      data:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: buildkitd
+          namespace: "{{ request.object.metadata.name }}"
+          labels:
+            app: buildkitd
+        spec:
+          ports:
+          - port: 1234
+            protocol: TCP
+          selector:
+            app: buildkitd
