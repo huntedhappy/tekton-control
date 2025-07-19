@@ -1,0 +1,116 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: workloads.tekton.platform
+spec:
+  group: tekton.platform
+  scope: Namespaced
+  names:
+    plural: workloads
+    singular: workload
+    kind: Workload
+    shortNames:
+      - wk
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                build:
+                  type: object
+                  properties:
+                    env:
+                      type: array
+                      items:
+                        type: string
+                env:
+                  type: array
+                  items:
+                    type: string
+                resources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                        memory:
+                          type: string
+                    limits:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                        memory:
+                          type: string
+                autoscaling:
+                  description: HorizontalPodAutoscaler settings
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                    minReplicas:
+                      type: integer
+                      format: int32
+                      default: 1
+                    maxReplicas:
+                      type: integer
+                      format: int32
+                    targetCPUUtilizationPercentage:
+                      type: integer
+                      format: int32
+                    targetMemoryUtilizationPercentage:
+                      type: integer
+                      format: int32
+                source:
+                  description: Git source for Workload
+                  type: object
+                  properties:
+                    git:
+                      type: object
+                      properties:
+                        url:
+                          type: string
+                        ref:
+                          type: object
+                          properties:
+                            branch:
+                              type: string
+                params:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      value:
+                        x-kubernetes-preserve-unknown-fields: true
+                    required:
+                      - name
+                      - value
+              required:
+                - params
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                lastAppliedRevision:
+                  type: string
+                lastCommitSHA:
+                  type: string
+                lastPipelineRunName:
+                  type: string
+                lastObservedSpecHash:
+                  type: string
+                phase:
+                  type: string
+      subresources:
+        status: {}

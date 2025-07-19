@@ -1,0 +1,231 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-triggers
+spec:
+  generateExisting: true
+  background: true
+  rules:
+    # --- TriggerBinding 생성 ---
+    - name: generate-tekton-git-binding-rule
+      match:
+        resources:
+          kinds: ["Workload"]
+      generate:
+        apiVersion: triggers.tekton.dev/v1beta1
+        kind: TriggerBinding
+        name: git-binding
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        data:
+          apiVersion: triggers.tekton.dev/v1beta1
+          kind: TriggerBinding
+          metadata:
+            name: git-binding
+            namespace: "{{ request.object.metadata.namespace }}"
+          spec:
+            params:
+              - name: ci-git-revision
+                value: '\$(body.checkout_sha)'
+              - name: ci-git-branch
+                value: '\$(body.ref)'
+              - name: ci-git-url
+                value: '\$(body.project.git_http_url)'
+              - name: ci-git-repo-path
+                value: '\$(body.project.path_with_namespace)'
+              - name: ci-git-project-name
+                value: '\$(body.project.name)'
+              - name: buildServiceBindings
+                value: "{{ request.object.spec.params[?(@.name=='buildServiceBindings')].value | [0] }}"
+
+    # --- TriggerTemplate: buildServiceBindings 값이 있을 때 ---
+    - name: generate-master-pipeline-private
+      match:
+        resources:
+          kinds: ["Workload"]
+      preconditions:
+        all:
+          - key: "{{ length(request.object.spec.params[?(@.name=='buildServiceBindings')].value) }}"
+            operator: GreaterThan
+            value: 0
+      generate:
+        apiVersion: triggers.tekton.dev/v1beta1
+        kind: TriggerTemplate
+        name: master-pipeline-template
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        data:
+          apiVersion: triggers.tekton.dev/v1beta1
+          kind: TriggerTemplate
+          metadata:
+            name: master-pipeline-template
+            namespace: "{{ request.object.metadata.namespace }}"
+          spec:
+            params:
+              - name: ci-git-revision
+              - name: ci-git-branch
+              - name: ci-git-url
+              - name: ci-git-repo-path
+              - name: ci-git-project-name
+              - name: build_workspace_claim
+                default: "{{ request.object.metadata.annotations.\"tekton.platform/build_workspace_claim\" | 'shared-data' }}"
+              - name: build_git_secret
+                default: "{{ request.object.metadata.annotations.\"tekton.platform/build_git_secret\" | 'git-credentials' }}"
+              - name: buildServiceBindings
+                description: JSON array of all service bindings
+                default: "{{ request.object.spec.params[?(@.name=='buildServiceBindings')].value | [0] }}"
+            resourcetemplates:
+              - apiVersion: tekton.dev/v1
+                kind: PipelineRun
+                metadata:
+                  generateName: master-pipeline-run-
+                  namespace: "{{ request.object.metadata.namespace }}"
+                spec:
+                  taskRunTemplate:
+                    podTemplate:
+                      securityContext:
+                        runAsUser: 0
+                        fsGroup: 0
+                    serviceAccountName: pipeline
+                  pipelineRef:
+                    name: master-ci-pipeline-private
+                  params:
+                    - name: ci-git-revision
+                      value: '\$(tt.params.ci-git-revision)'
+                    - name: ci-git-branch
+                      value: '\$(tt.params.ci-git-branch)'
+                    - name: ci-git-url
+                      value: '\$(tt.params.ci-git-url)'
+                    - name: ci-git-repo-path
+                      value: '\$(tt.params.ci-git-repo-path)'
+                    - name: ci-git-project-name
+                      value: '\$(tt.params.ci-git-project-name)'
+                    - name: build_workspace_claim
+                      value: '\$(tt.params.build_workspace_claim)'
+                    - name: build_git_secret
+                      value: '\$(tt.params.build_git_secret)'
+                    - name: buildServiceBindings
+                      value: '\$(tt.params.buildServiceBindings)'
+                  workspaces:
+                    - name: shared-data
+                      persistentVolumeClaim:
+                        claimName: '\$(params.build_workspace_claim)'
+                    - name: cache-data
+                      persistentVolumeClaim:
+                        claimName: cache-data
+                    - name: git-credentials
+                      secret:
+                        secretName: '\$(params.build_git_secret)'
+                    - name: settings-xml
+                      secret:
+                        secretName: '\$(params.buildServiceBindings)'
+
+    - name: generate-master-pipeline-template-rule
+      match:
+        resources:
+          kinds: ["Workload"]
+      preconditions:
+        all:
+          - key: "{{ contains(request.object.spec.params[].name, 'buildServiceBindings') }}"
+            operator: Equals
+            value: false
+      generate:
+        apiVersion: triggers.tekton.dev/v1beta1
+        kind: TriggerTemplate
+        name: master-pipeline-template
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        data:
+          apiVersion: triggers.tekton.dev/v1beta1
+          kind: TriggerTemplate
+          metadata:
+            name: master-pipeline-template
+            namespace: "{{ request.object.metadata.namespace }}"
+          spec:
+            params:
+              - name: ci-git-revision
+              - name: ci-git-branch
+              - name: ci-git-url
+              - name: ci-git-repo-path
+              - name: ci-git-project-name
+              - name: build_workspace_claim
+                default: "{{ request.object.metadata.annotations.\"tekton.platform/build_workspace_claim\" | 'shared-data' }}"
+              - name: build_git_secret
+                default: "{{ request.object.metadata.annotations.\"tekton.platform/build_git_secret\" | 'git-credentials' }}"
+            resourcetemplates:
+              - apiVersion: tekton.dev/v1
+                kind: PipelineRun
+                metadata:
+                  generateName: master-pipeline-run-
+                  namespace: "{{ request.object.metadata.namespace }}"
+                spec:
+                  taskRunTemplate:
+                    podTemplate:
+                      securityContext:
+                        runAsUser: 0
+                        fsGroup: 0
+                    serviceAccountName: pipeline
+                  pipelineRef:
+                    name: master-ci-pipeline-private
+                  params:
+                    - name: ci-git-revision
+                      value: '\$(tt.params.ci-git-revision)'
+                    - name: ci-git-branch
+                      value: '\$(tt.params.ci-git-branch)'
+                    - name: ci-git-url
+                      value: '\$(tt.params.ci-git-url)'
+                    - name: ci-git-repo-path
+                      value: '\$(tt.params.ci-git-repo-path)'
+                    - name: ci-git-project-name
+                      value: '\$(tt.params.ci-git-project-name)'
+                    - name: build_workspace_claim
+                      value: '\$(tt.params.build_workspace_claim)'
+                    - name: build_git_secret
+                      value: '\$(tt.params.build_git_secret)'
+                  workspaces:
+                    - name: shared-data
+                      persistentVolumeClaim:
+                        claimName: '\$(params.build_workspace_claim)'
+                    - name: cache-data
+                      persistentVolumeClaim:
+                        claimName: cache-data
+                    - name: git-credentials
+                      secret:
+                        secretName: '\$(params.build_git_secret)'
+
+    - name: generate-simple-listener
+      match:
+        resources:
+          kinds: ["Namespace"]
+          selector:
+            matchLabels:
+              tekton-enabled: "true"
+      generate:
+        apiVersion: triggers.tekton.dev/v1beta1
+        kind: EventListener
+        name: simple-listener
+        namespace: "{{ request.object.metadata.name }}"
+        synchronize: true
+        data:
+          apiVersion: triggers.tekton.dev/v1beta1
+          kind: EventListener
+          metadata:
+            name: simple-listener
+            namespace: "{{ request.object.metadata.name }}"
+          spec:
+            serviceAccountName: pipeline
+            triggers:
+              - name: git-push-trigger
+                interceptors:
+                  - ref:
+                      name: cel
+                    params:
+                      - name: filter
+                        value: >-
+                          body.ref == 'refs/heads/main' &&
+                          body.object_kind == 'push'
+                bindings:
+                  - ref: git-binding
+                template:
+                  ref: master-pipeline-template

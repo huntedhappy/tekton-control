@@ -1,0 +1,1348 @@
+// File: controllers/workload_controller.go
+package controllers
+
+import (
+	"context"
+	"fmt"
+
+	pipelinev1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	corev1 "k8s.io/api/core/v1"
+
+	tektonv1alpha1 "tekton-controller/api/v1alpha1"
+	"tekton-controller/pkg/git"
+	"tekton-controller/pkg/httpproxy"
+	"tekton-controller/pkg/pipeline"
+	"tekton-controller/pkg/util"
+
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
+)
+
+const (
+	workloadFinalizer = "tekton.platform/finalizer"
+	TypeReady         = "Ready"
+)
+
+type WorkloadReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Reconciling Workload", "namespace", req.Namespace, "name", req.Name)
+
+	var wl tektonv1alpha1.Workload
+	if err := r.Get(ctx, req.NamespacedName, &wl); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Initialize status conditions if not set
+	if wl.Status.Conditions == nil || len(wl.Status.Conditions) == 0 {
+		r.updateStatusCondition(ctx, &wl, metav1.ConditionUnknown, "Reconciling", "Starting reconciliation")
+	}
+
+	// Handle deletion
+	if wl.GetDeletionTimestamp() != nil {
+		if controllerutil.ContainsFinalizer(&wl, workloadFinalizer) {
+			if err := r.cleanupHTTPProxy(ctx, &wl); err != nil {
+				logger.Error(err, "cleanupHTTPProxy failed")
+			}
+			controllerutil.RemoveFinalizer(&wl, workloadFinalizer)
+			if err := r.Update(ctx, &wl); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Add finalizer if missing
+	if !controllerutil.ContainsFinalizer(&wl, workloadFinalizer) {
+		controllerutil.AddFinalizer(&wl, workloadFinalizer)
+		if err := r.Update(ctx, &wl); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Ensure HTTPProxy for workload
+	if err := r.ensureHTTPProxy(ctx, &wl); err != nil {
+		r.updateStatusCondition(ctx, &wl, metav1.ConditionFalse, "HTTPProxyError", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	// Sync PipelineRun status (update Workload.Status)
+	if err := r.syncPipelineRunStatus(ctx, &wl); err != nil {
+		logger.Error(err, "Failed to sync PipelineRun status")
+	}
+
+	// Check if workload spec has changed
+	if wl.Status.ObservedGeneration == wl.Generation && wl.Status.LastPipelineRun != "" {
+		logger.Info("No changes in Workload spec. Skipping PipelineRun creation.", "workload", wl.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// Resolve latest Git SHA
+	branch := wl.Spec.Source.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	repoURL := wl.Spec.Source.URL
+	auth, err := r.getGitAuth(ctx, wl.Namespace, util.GetAnnotation(&wl, "tekton.platform/build_git_secret"))
+	if err != nil {
+		logger.Error(err, "Failed to get Git auth from secret")
+		return ctrl.Result{}, err
+	}
+
+	resolver := git.NewResolver()
+	sha, err := resolver.ResolveGitSHA(ctx, repoURL, branch, auth)
+	if err != nil {
+		logger.Error(err, "Failed to resolve latest Git SHA")
+		return ctrl.Result{}, err
+	}
+	logger.Info("Resolved latest Git SHA", "branch", branch, "sha", sha)
+
+	// Build GitInfo
+	gitInfo := git.GitInfo{
+		Revision: sha,
+		Branch:   branch,
+		URL:      repoURL,
+		RepoPath: wl.Spec.Source.RepoPath,
+		Name:     wl.Name,
+	}
+
+	// Extract annotations and params
+	gitSecret := util.GetAnnotation(&wl, "tekton.platform/build_git_secret")
+	workspaceClaim := util.GetAnnotation(&wl, "tekton.platform/build_workspace_claim")
+	bindings := util.GetParam(&wl, "buildServiceBindings")
+
+	// Create new PipelineRun
+	pr, err := pipeline.NewPipelineRun(ctx, &wl, gitInfo, gitSecret, workspaceClaim, bindings)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Create(ctx, pr); err != nil && !apierrors.IsAlreadyExists(err) {
+		return ctrl.Result{}, err
+	}
+
+	// Update status after creating PipelineRun
+	wl.Status.LastPipelineRun = pr.Name
+	wl.Status.ObservedGeneration = wl.Generation
+	r.updateStatusCondition(ctx, &wl, metav1.ConditionTrue, "Reconciled",
+		fmt.Sprintf("PipelineRun %s created with SHA %s", pr.Name, sha))
+
+	return ctrl.Result{}, r.Status().Update(ctx, &wl)
+}
+
+// syncPipelineRunStatus updates Workload.Status fields based on the latest PipelineRun.
+func (r *WorkloadReconciler) syncPipelineRunStatus(ctx context.Context, wl *tektonv1alpha1.Workload) error {
+	var prList pipelinev1beta1.PipelineRunList
+	if err := r.List(ctx, &prList, client.InNamespace(wl.Namespace)); err != nil {
+		return err
+	}
+
+	var latestPR *pipelinev1beta1.PipelineRun
+	for i, pr := range prList.Items {
+		if pr.Labels["workload"] == wl.Name {
+			if latestPR == nil || pr.CreationTimestamp.After(latestPR.CreationTimestamp.Time) {
+				latestPR = &prList.Items[i]
+			}
+		}
+	}
+
+	if latestPR == nil {
+		return nil // No PipelineRun found
+	}
+
+	// Update PipelineRun status fields
+	if len(latestPR.Status.Conditions) > 0 {
+		cond := latestPR.Status.Conditions[0]
+		wl.Status.PipelineRunStatus = string(cond.Status)
+		wl.Status.PipelineRunReason = cond.Reason
+	}
+
+	if latestPR.Status.StartTime != nil {
+		wl.Status.LastPipelineRunStartTime = latestPR.Status.StartTime
+	}
+
+	if latestPR.Status.CompletionTime != nil {
+		wl.Status.LastPipelineRunCompletionTime = latestPR.Status.CompletionTime
+	}
+
+	// Artifact Image (from PipelineRun results, if present)
+	for _, tr := range latestPR.Status.PipelineResults {
+		if tr.Name == "IMAGE_URL" {
+			wl.Status.ArtifactImage = tr.Value.StringVal
+		}
+	}
+
+	return r.Status().Update(ctx, wl)
+}
+
+// getGitAuth retrieves BasicAuth from the referenced Secret (username/password).
+func (r *WorkloadReconciler) getGitAuth(ctx context.Context, namespace, secretName string) (*http.BasicAuth, error) {
+	if secretName == "" {
+		return nil, nil
+	}
+
+	var secret corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
+		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
+	}
+
+	return git.GetGitAuthFromSecret(&secret)
+}
+
+func (r *WorkloadReconciler) ensureHTTPProxy(ctx context.Context, wl *tektonv1alpha1.Workload) error {
+	u, err := util.ObjectToUnstructured(wl)
+	if err != nil {
+		return fmt.Errorf("convert Workload to unstructured: %w", err)
+	}
+	return httpproxy.HandleHTTPProxyListener(ctx, r.Client, u)
+}
+
+func (r *WorkloadReconciler) cleanupHTTPProxy(ctx context.Context, wl *tektonv1alpha1.Workload) error {
+	return httpproxy.CleanupListenerForNamespace(ctx, r.Client, wl.Namespace)
+}
+
+func (r *WorkloadReconciler) updateStatusCondition(ctx context.Context, wl *tektonv1alpha1.Workload, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{
+		Type:    TypeReady,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
+	if err := r.Status().Update(ctx, wl); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to update Workload status condition")
+	}
+}
+
+func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&tektonv1alpha1.Workload{}).
+		Owns(&pipelinev1beta1.PipelineRun{}).
+		Complete(r)
+}
+// File: api/v1alpha1/groupversion_info.go
+package v1alpha1
+
+import (
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
+)
+
+// GroupVersion is group version used to register these objects
+var GroupVersion = schema.GroupVersion{Group: "tekton.platform", Version: "v1alpha1"}
+
+// SchemeBuilder is used to add go types to the GroupVersionKind scheme
+var SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+
+// AddToScheme adds the types in this group-version to the given scheme.
+var AddToScheme = SchemeBuilder.AddToScheme
+// File: api/v1alpha1/workload_types.go
+package v1alpha1
+
+import (
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// Param defines a key-value parameter for the pipeline.
+type Param struct {
+    Name  string `json:"name"`
+    Value string `json:"value"`
+}
+
+// GitSource defines Git repository configuration.
+type GitSource struct {
+    URL      string `json:"url"`
+    Revision string `json:"revision"`
+    Branch   string `json:"branch,omitempty"`
+    RepoPath string `json:"repoPath,omitempty"`
+}
+
+// BuildConfig defines environment variables for the build process.
+type BuildConfig struct {
+    Env []string `json:"env,omitempty"`
+}
+
+// ResourceConfig defines CPU and memory requests/limits.
+type ResourceConfig struct {
+    Limits   map[string]string `json:"limits,omitempty"`
+    Requests map[string]string `json:"requests,omitempty"`
+}
+
+// AutoScalingConfig defines horizontal autoscaling parameters.
+type AutoScalingConfig struct {
+    Enabled                         bool `json:"enabled"`
+    MinReplicas                     int  `json:"minReplicas"`
+    MaxReplicas                     int  `json:"maxReplicas"`
+    TargetCPUUtilizationPercentage  int  `json:"targetCPUUtilizationPercentage"`
+    TargetMemoryUtilizationPercentage int `json:"targetMemoryUtilizationPercentage"`
+}
+
+// +kubebuilder:object:generate=true
+type WorkloadSpec struct {
+    Source      GitSource          `json:"source"`
+    Params      []Param            `json:"params,omitempty"`
+    Build       BuildConfig        `json:"build,omitempty"`
+    Resources   ResourceConfig     `json:"resources,omitempty"`
+    Autoscaling AutoScalingConfig  `json:"autoscaling,omitempty"`
+}
+
+// WorkloadStatus defines the observed state of Workload
+type WorkloadStatus struct {
+    ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+    LastPipelineRun    string `json:"lastPipelineRun,omitempty"`
+
+    PipelineRunStatus     string       `json:"pipelineRunStatus,omitempty"`
+    PipelineRunReason     string       `json:"pipelineRunReason,omitempty"`
+    LastPipelineRunStartTime *metav1.Time `json:"lastPipelineRunStartTime,omitempty"`
+    LastPipelineRunCompletionTime *metav1.Time `json:"lastPipelineRunCompletionTime,omitempty"`
+    ArtifactImage         string       `json:"artifactImage,omitempty"`
+
+    Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Pipeline",type="string",JSONPath=".status.pipelineRunStatus"
+// +kubebuilder:printcolumn:name="Image",type="string",JSONPath=".status.artifactImage"
+// +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Reason",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].reason"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+type Workload struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+
+    Spec   WorkloadSpec   `json:"spec,omitempty"`
+    Status WorkloadStatus `json:"status,omitempty"`
+}
+
+
+// +kubebuilder:object:root=true
+type WorkloadList struct {
+    metav1.TypeMeta `json:",inline"`
+    metav1.ListMeta `json:"metadata,omitempty"`
+    Items           []Workload `json:"items"`
+}
+
+func init() {
+    SchemeBuilder.Register(&Workload{}, &WorkloadList{})
+}
+//go:build !ignore_autogenerated
+// +build !ignore_autogenerated
+
+// Code generated by controller-gen. DO NOT EDIT.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Code generated by controller-gen. DO NOT EDIT.
+
+package v1alpha1
+
+import (
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	runtime "k8s.io/apimachinery/pkg/runtime"
+)
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *Workload) DeepCopyInto(out *Workload) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	in.Spec.DeepCopyInto(&out.Spec)
+	in.Status.DeepCopyInto(&out.Status)
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new Workload.
+func (in *Workload) DeepCopy() *Workload {
+	if in == nil {
+		return nil
+	}
+	out := new(Workload)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
+func (in *Workload) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *WorkloadList) DeepCopyInto(out *WorkloadList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		in, out := &in.Items, &out.Items
+		*out = make([]Workload, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WorkloadList.
+func (in *WorkloadList) DeepCopy() *WorkloadList {
+	if in == nil {
+		return nil
+	}
+	out := new(WorkloadList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
+func (in *WorkloadList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *WorkloadSpec) DeepCopyInto(out *WorkloadSpec) {
+	*out = *in
+	out.Source = in.Source
+	if in.Params != nil {
+		in, out := &in.Params, &out.Params
+		*out = make([]Param, len(*in))
+		copy(*out, *in)
+	}
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WorkloadSpec.
+func (in *WorkloadSpec) DeepCopy() *WorkloadSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(WorkloadSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *WorkloadStatus) DeepCopyInto(out *WorkloadStatus) {
+	*out = *in
+	if in.Conditions != nil {
+		in, out := &in.Conditions, &out.Conditions
+		*out = make([]v1.Condition, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WorkloadStatus.
+func (in *WorkloadStatus) DeepCopy() *WorkloadStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(WorkloadStatus)
+	in.DeepCopyInto(out)
+	return out
+}
+// File: pkg/git/resolver.go
+package git
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
+	"github.com/go-git/go-git/v5/storage/memory"
+	corev1 "k8s.io/api/core/v1"
+)
+
+const (
+	GitSHACacheTTLKey            = "GIT_SHA_CACHE_TTL_SECONDS"
+	DefaultGitSHACacheTTLSeconds = 60 // 1 minute
+	UsernameField                = "username"
+	PasswordField                = "password"
+)
+
+// SHACacheEntry stores cached SHA with a timestamp.
+type SHACacheEntry struct {
+	SHA       string
+	Timestamp time.Time
+}
+
+// GitInfo stores Git repository metadata (Revision, Branch, etc.)
+type GitInfo struct {
+	Revision string
+	Branch   string
+	URL      string
+	RepoPath string
+	Name     string
+}
+
+// Resolver handles Git SHA resolution with caching.
+type Resolver struct {
+	SHACache    map[string]SHACacheEntry
+	SHAMutex    sync.RWMutex
+	SHACacheTTL time.Duration
+}
+
+// NewResolver creates a new Git Resolver with SHA caching.
+func NewResolver() *Resolver {
+	ttl := time.Duration(DefaultGitSHACacheTTLSeconds) * time.Second
+	if v := os.Getenv(GitSHACacheTTLKey); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			ttl = time.Duration(secs) * time.Second
+		}
+	}
+	return &Resolver{
+		SHACache:    make(map[string]SHACacheEntry),
+		SHACacheTTL: ttl,
+	}
+}
+
+// GetGitAuthFromSecret reads Git auth info from a Secret.
+func GetGitAuthFromSecret(secret *corev1.Secret) (*http.BasicAuth, error) {
+	user := string(secret.Data[UsernameField])
+	pass := string(secret.Data[PasswordField])
+	if user == "" || pass == "" {
+		return nil, fmt.Errorf("username or password not found in secret")
+	}
+	return &http.BasicAuth{Username: user, Password: pass}, nil
+}
+
+// ResolveGitSHA resolves the latest commit SHA for the specified branch using caching.
+func (r *Resolver) ResolveGitSHA(ctx context.Context, repoURL, branch string, auth *http.BasicAuth) (string, error) {
+	cacheKey := fmt.Sprintf("%s|%s", repoURL, branch)
+	now := time.Now()
+
+	r.SHAMutex.RLock()
+	entry, cached := r.SHACache[cacheKey]
+	r.SHAMutex.RUnlock()
+
+	if cached && now.Sub(entry.Timestamp) < r.SHACacheTTL {
+		return entry.SHA, nil
+	}
+
+	// Fetch from remote repository
+	storer := memory.NewStorage()
+	repo, err := git.Init(storer, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to init git repo: %w", err)
+	}
+
+	_, err = repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{repoURL}})
+	if err != nil && err != git.ErrRemoteExists {
+		return "", fmt.Errorf("failed to add remote: %w", err)
+	}
+
+	if err := repo.FetchContext(ctx, &git.FetchOptions{
+		RemoteName: "origin",
+		Depth:      1,
+		RefSpecs:   []config.RefSpec{config.RefSpec(fmt.Sprintf("+refs/heads/%s:refs/heads/%s", branch, branch))},
+		Auth:       auth,
+		Tags:       git.NoTags,
+	}); err != nil && err != git.NoErrAlreadyUpToDate {
+		return "", fmt.Errorf("failed to fetch branch %s: %w", branch, err)
+	}
+
+	ref, err := repo.Reference(plumbing.NewBranchReferenceName(branch), true)
+	if err != nil {
+		return "", fmt.Errorf("failed to get branch ref: %w", err)
+	}
+
+	sha := ref.Hash().String()
+
+	r.SHAMutex.Lock()
+	r.SHACache[cacheKey] = SHACacheEntry{SHA: sha, Timestamp: now}
+	r.SHAMutex.Unlock()
+
+	return sha, nil
+}
+// File: pkg/httpproxy/httpproxy_listener_handler.go
+package httpproxy
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	HTTPProxyGroup   = "projectcontour.io"
+	HTTPProxyVersion = "v1"
+	HTTPProxyKind    = "HTTPProxy"
+	globalProxyNS    = "argocd"
+	globalProxyName  = "proxy-to-listener"
+	maxRetries       = 5
+)
+
+// HandleHTTPProxyListener manages the lifecycle of an HTTPProxy listener based on workload status.
+func HandleHTTPProxyListener(ctx context.Context, c client.Client, workload *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+	ns := workload.GetNamespace()
+	listenerName := fmt.Sprintf("%s-listener", ns)
+
+	// If workload is being deleted, cleanup listener and global includes
+	if workload.GetDeletionTimestamp() != nil {
+		logger.Info("Workload is deleting: cleaning up HTTPProxy listener and global include", "listener", listenerName)
+		return CleanupListenerForNamespace(ctx, c, ns)
+	}
+
+	svcName, found := workload.GetAnnotations()["listenerService"]
+	if !found || svcName == "" {
+		svcName = "el-simple-listener"
+	}
+
+	logger.Info("Ensuring listener and global include are correctly configured", "listener", listenerName)
+
+	// Ensure listener
+	if err := retry(func() error {
+		return ensureListener(ctx, c, listenerName, ns, svcName)
+	}); err != nil {
+		return fmt.Errorf("failed to ensure listener HTTPProxy: %w", err)
+	}
+
+	// Ensure global include
+	if err := retry(func() error {
+		return ensureGlobalProxyInclude(ctx, c, listenerName, ns)
+	}); err != nil {
+		return fmt.Errorf("failed to update include in global HTTPProxy: %w", err)
+	}
+
+	logger.Info("Successfully applied listener and global include", "listener", listenerName)
+	return nil
+}
+
+// CleanupListenerForNamespace deletes listener HTTPProxy and removes its global include
+func CleanupListenerForNamespace(ctx context.Context, c client.Client, namespace string) error {
+	logger := log.FromContext(ctx)
+	listenerName := fmt.Sprintf("%s-listener", namespace)
+	var lastErr error
+
+	if err := retry(func() error {
+		return deleteListener(ctx, c, listenerName, namespace)
+	}); err != nil {
+		logger.Error(err, "Failed to delete listener HTTPProxy")
+		lastErr = err
+	}
+
+	if err := retry(func() error {
+		return removeGlobalProxyInclude(ctx, c, listenerName, namespace)
+	}); err != nil {
+		logger.Error(err, "Failed to remove include from global HTTPProxy")
+		lastErr = err
+	}
+
+	if lastErr == nil {
+		logger.Info("Successfully cleaned up listener and global include", "listener", listenerName)
+	}
+	return lastErr
+}
+
+// ensureListener creates or updates an HTTPProxy listener
+func ensureListener(ctx context.Context, c client.Client, listenerName, ns, svcName string) error {
+	logger := log.FromContext(ctx)
+	proxy := &unstructured.Unstructured{}
+	proxy.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   HTTPProxyGroup,
+		Version: HTTPProxyVersion,
+		Kind:    HTTPProxyKind,
+	})
+	proxy.SetNamespace(ns)
+	proxy.SetName(listenerName)
+
+	desiredSpec := map[string]interface{}{
+		"routes": []interface{}{
+			map[string]interface{}{
+				"services": []interface{}{
+					map[string]interface{}{
+						"name": svcName,
+						"port": int64(8080),
+					},
+				},
+			},
+		},
+	}
+
+	// Check if it exists
+	err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: listenerName}, proxy)
+	if errors.IsNotFound(err) {
+		proxy.Object["spec"] = desiredSpec
+		logger.Info("Creating listener HTTPProxy", "listener", listenerName)
+		return c.Create(ctx, proxy)
+	} else if err != nil {
+		return fmt.Errorf("get listener HTTPProxy %q: %w", listenerName, err)
+	}
+
+	// If exists, update only if svcName changed
+	currentSvc, _, _ := unstructured.NestedString(proxy.Object, "spec", "routes", "0", "services", "0", "name")
+	if currentSvc != svcName {
+		_ = unstructured.SetNestedField(proxy.Object, svcName, "spec", "routes", "0", "services", "0", "name")
+		logger.Info("Updating listener HTTPProxy with new service name", "listener", listenerName, "service", svcName)
+		return c.Update(ctx, proxy)
+	}
+	return nil
+}
+
+func deleteListener(ctx context.Context, c client.Client, listenerName, ns string) error {
+	del := &unstructured.Unstructured{}
+	del.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   HTTPProxyGroup,
+		Version: HTTPProxyVersion,
+		Kind:    HTTPProxyKind,
+	})
+	del.SetNamespace(ns)
+	del.SetName(listenerName)
+
+	if err := c.Delete(ctx, del); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete listener HTTPProxy %q: %w", listenerName, err)
+	}
+	return nil
+}
+
+func ensureGlobalProxyInclude(ctx context.Context, c client.Client, listenerName, ns string) error {
+	gp, err := getGlobalProxy(ctx, c)
+	if gp == nil || err != nil {
+		return err
+	}
+
+	incs, _, _ := unstructured.NestedSlice(gp.Object, "spec", "includes")
+	newInclude := map[string]interface{}{
+		"name":      listenerName,
+		"namespace": ns,
+		"conditions": []interface{}{
+			map[string]interface{}{
+				"prefix": fmt.Sprintf("/%s", ns),
+			},
+		},
+	}
+
+	// Avoid duplicates
+	for _, item := range incs {
+		if incMap, ok := item.(map[string]interface{}); ok &&
+			incMap["name"] == listenerName && incMap["namespace"] == ns {
+			return nil
+		}
+	}
+
+	incs = append(incs, newInclude)
+	if err := unstructured.SetNestedSlice(gp.Object, incs, "spec", "includes"); err != nil {
+		return fmt.Errorf("set includes on global proxy: %w", err)
+	}
+	return c.Update(ctx, gp)
+}
+
+func removeGlobalProxyInclude(ctx context.Context, c client.Client, listenerName, ns string) error {
+	gp, err := getGlobalProxy(ctx, c)
+	if gp == nil || err != nil {
+		return err
+	}
+
+	incs, found, err := unstructured.NestedSlice(gp.Object, "spec", "includes")
+	if err != nil || !found {
+		return nil
+	}
+
+	newIncs := []interface{}{}
+	for _, item := range incs {
+		if incMap, ok := item.(map[string]interface{}); ok &&
+			incMap["name"] == listenerName && incMap["namespace"] == ns {
+			continue
+		}
+		newIncs = append(newIncs, item)
+	}
+
+	if err := unstructured.SetNestedSlice(gp.Object, newIncs, "spec", "includes"); err != nil {
+		return fmt.Errorf("set includes on global proxy after removal: %w", err)
+	}
+	return c.Update(ctx, gp)
+}
+
+func getGlobalProxy(ctx context.Context, c client.Client) (*unstructured.Unstructured, error) {
+	gp := &unstructured.Unstructured{}
+	gp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   HTTPProxyGroup,
+		Version: HTTPProxyVersion,
+		Kind:    HTTPProxyKind,
+	})
+	if err := c.Get(ctx, client.ObjectKey{Namespace: globalProxyNS, Name: globalProxyName}, gp); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get global HTTPProxy: %w", err)
+	}
+	return gp, nil
+}
+
+func retry(fn func() error) error {
+	backoff := wait.Backoff{
+		Steps:    maxRetries,
+		Duration: 200 * time.Millisecond,
+		Factor:   2.0,
+		Jitter:   0.1,
+	}
+	return wait.ExponentialBackoff(backoff, func() (bool, error) {
+		err := fn()
+		if err == nil {
+			return true, nil
+		}
+		if errors.IsConflict(err) || errors.IsServerTimeout(err) || errors.IsTooManyRequests(err) {
+			return false, nil
+		}
+		return false, err
+	})
+}
+// File: pkg/namespace/namespace_cleanup_handler.go
+package namespace
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	pipelinev1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	triggersv1beta1 "github.com/tektoncd/triggers/pkg/apis/triggers/v1beta1"
+	"tekton-controller/pkg/httpproxy"
+)
+
+type NamespaceCleanupReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+func (r *NamespaceCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Namespace{}).
+		Complete(r)
+}
+
+func (r *NamespaceCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	nsName := req.Name
+
+	var ns corev1.Namespace
+	if err := r.Get(ctx, req.NamespacedName, &ns); err != nil {
+		logger.Error(err, "Failed to get Namespace", "namespace", nsName)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if ns.GetDeletionTimestamp() == nil {
+		return ctrl.Result{}, nil
+	}
+
+	if val, ok := ns.Labels["tekton-enabled"]; !ok || val != "true" {
+		logger.Info("Namespace is not tekton-enabled, skipping cleanup", "namespace", nsName)
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("tekton-enabled namespace is being deleted, starting cleanup", "namespace", nsName)
+
+	// Clean up Tekton resources with retry
+	if err := r.cleanupTektonResourcesWithRetry(ctx, nsName); err != nil {
+		logger.Error(err, "Tekton resources cleanup failed after retries", "namespace", nsName)
+	}
+
+	// Clean up HTTPProxy
+	if err := httpproxy.CleanupListenerForNamespace(ctx, r.Client, nsName); err != nil {
+		logger.Error(err, "Namespace HTTPProxy cleanup failed", "namespace", nsName)
+	}
+
+	logger.Info("Namespace cleanup finished", "namespace", nsName)
+	return ctrl.Result{}, nil
+}
+
+func (r *NamespaceCleanupReconciler) cleanupTektonResourcesWithRetry(ctx context.Context, namespace string) error {
+	logger := log.FromContext(ctx)
+	deleteObjs := []client.Object{
+		&pipelinev1beta1.PipelineRun{},
+		&pipelinev1beta1.TaskRun{},
+		&pipelinev1beta1.Pipeline{},
+		&pipelinev1beta1.Task{},
+		&triggersv1beta1.TriggerTemplate{},
+		&triggersv1beta1.TriggerBinding{},
+		&triggersv1beta1.EventListener{},
+	}
+
+	for _, obj := range deleteObjs {
+		var err error
+		for i := 0; i < 3; i++ { // 재시도 3회
+			err = r.DeleteAllOf(ctx, obj, client.InNamespace(namespace))
+			if err == nil {
+				logger.Info("Deleted resources", "kind", obj.GetObjectKind().GroupVersionKind().Kind, "namespace", namespace)
+				break
+			}
+			logger.Error(err, "Failed to delete resource, retrying...", "kind", obj.GetObjectKind().GroupVersionKind().Kind, "attempt", i+1)
+			time.Sleep(2 * time.Second)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to delete %s after 3 retries: %w", obj.GetObjectKind().GroupVersionKind().Kind, err)
+		}
+	}
+	return nil
+}
+// File: pkg/pipeline/builder.go
+package pipeline
+
+import (
+	"context"
+	"strings"
+
+	pipelinev1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	tektonv1alpha1 "tekton-controller/api/v1alpha1"
+	"tekton-controller/pkg/git"
+	"tekton-controller/pkg/util"
+)
+
+// NewPipelineRun builds a Tekton PipelineRun from Workload.
+func NewPipelineRun(ctx context.Context, wl *tektonv1alpha1.Workload, gitInfo git.GitInfo,
+	gitSecret, workspaceClaim, bindings string) (*pipelinev1beta1.PipelineRun, error) {
+
+	params := []pipelinev1beta1.Param{
+		{
+			Name:  "ci-git-revision",
+			Value: pipelinev1beta1.ParamValue{Type: pipelinev1beta1.ParamTypeString, StringVal: gitInfo.Revision},
+		},
+		{
+			Name:  "ci-git-branch",
+			Value: pipelinev1beta1.ParamValue{Type: pipelinev1beta1.ParamTypeString, StringVal: gitInfo.Branch},
+		},
+		{
+			Name:  "ci-git-url",
+			Value: pipelinev1beta1.ParamValue{Type: pipelinev1beta1.ParamTypeString, StringVal: gitInfo.URL},
+		},
+		{
+			Name:  "ci-git-repo-path",
+			Value: pipelinev1beta1.ParamValue{Type: pipelinev1beta1.ParamTypeString, StringVal: gitInfo.RepoPath},
+		},
+		{
+			Name:  "ci-git-project-name",
+			Value: pipelinev1beta1.ParamValue{Type: pipelinev1beta1.ParamTypeString, StringVal: gitInfo.Name},
+		},
+	}
+
+	// Add user-defined params from Workload.Spec.Params
+	for _, p := range wl.Spec.Params {
+		params = append(params, pipelinev1beta1.Param{
+			Name:  p.Name,
+			Value: pipelinev1beta1.ParamValue{Type: pipelinev1beta1.ParamTypeString, StringVal: p.Value},
+		})
+	}
+
+	// Determine cache claim
+	cacheClaim := util.GetAnnotation(wl, "tekton.platform/build_cache_claim")
+	if cacheClaim == "" {
+		cacheClaim = "cache-data"
+	}
+
+	// Build initial workspaces
+	workspaces := []pipelinev1beta1.WorkspaceBinding{
+		{
+			Name:                  "shared-data",
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: workspaceClaim},
+		},
+		{
+			Name:                  "cache-data",
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: cacheClaim},
+		},
+		{
+			Name:   "git-credentials",
+			Secret: &corev1.SecretVolumeSource{SecretName: gitSecret},
+		},
+	}
+
+	// Add service bindings (if any)
+	workspaces = addServiceBindings(workspaces, bindings)
+
+	return &pipelinev1beta1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: wl.GetName() + "-pr-",
+			Namespace:    wl.GetNamespace(),
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(wl, tektonv1alpha1.GroupVersion.WithKind("Workload")),
+			},
+		},
+		Spec: pipelinev1beta1.PipelineRunSpec{
+			PipelineRef: &pipelinev1beta1.PipelineRef{Name: "master-ci-pipeline"},
+			Params:      params,
+			Workspaces:  workspaces,
+		},
+	}, nil
+}
+
+// addServiceBindings parses comma-separated secret names and appends them as workspaces.
+func addServiceBindings(workspaces []pipelinev1beta1.WorkspaceBinding, bindings string) []pipelinev1beta1.WorkspaceBinding {
+	if bindings == "" {
+		return workspaces
+	}
+
+	for _, binding := range strings.Split(bindings, ",") {
+		trimmed := strings.TrimSpace(binding)
+		if trimmed == "" {
+			continue
+		}
+		workspaces = append(workspaces, pipelinev1beta1.WorkspaceBinding{
+			Name:   trimmed,
+			Secret: &corev1.SecretVolumeSource{SecretName: trimmed},
+		})
+	}
+	return workspaces
+}
+// File: pkg/util/util.go
+package util
+
+import (
+	tektonv1alpha1 "tekton-controller/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+func GetAnnotation(wl *tektonv1alpha1.Workload, key string) string {
+	if wl.Annotations == nil {
+		return ""
+	}
+	return wl.Annotations[key]
+}
+
+func GetParam(wl *tektonv1alpha1.Workload, name string) string {
+	for _, p := range wl.Spec.Params {
+		if p.Name == name {
+			return p.Value
+		}
+	}
+	return ""
+}
+
+// CORRECTED: A robust function to convert any runtime.Object to unstructured.Unstructured
+func ObjectToUnstructured(obj runtime.Object) (*unstructured.Unstructured, error) {
+	// unstructured.Unstructured is a runtime.Object, so we can convert
+	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return nil, err
+	}
+	return &unstructured.Unstructured{Object: content}, nil
+}
+// File: main.go
+package main
+
+import (
+	"flag"
+	"os"
+	"path/filepath" // path/filepath 패키지 추가
+
+	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	// to ensure that exec-entrypoint and run can make use of them.
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	tektonv1alpha1 "tekton-controller/api/v1alpha1"
+	"tekton-controller/controllers"
+	"tekton-controller/pkg/namespace"
+	pipelinev1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+)
+
+var (
+	scheme   = runtime.NewScheme()
+	setupLog = ctrl.Log.WithName("setup")
+)
+
+func init() {
+    utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+    utilruntime.Must(tektonv1alpha1.AddToScheme(scheme))
+    utilruntime.Must(pipelinev1beta1.AddToScheme(scheme)) // <-- 추가
+}
+
+func main() {
+	var metricsAddr string
+	var enableLeaderElection bool
+	var probeAddr string
+	var secureMetrics bool
+	var tlsCertDir string
+
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", false, "If set, the metrics endpoint is served securely.")
+	flag.StringVar(&tlsCertDir, "tls-cert-dir", "", "Directory containing the TLS certificate and key. Required if --metrics-secure is set.")
+
+	opts := zap.Options{Development: true}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// --- 로직 추가: Secure Metrics가 활성화된 경우, 인증서 파일 존재 여부 확인 ---
+	if secureMetrics {
+		if tlsCertDir == "" {
+			setupLog.Error(nil, "--tls-cert-dir must be set if --metrics-secure is true")
+			os.Exit(1)
+		}
+		// 인증서와 키 파일 경로 확인
+		certPath := filepath.Join(tlsCertDir, "tls.crt")
+		keyPath := filepath.Join(tlsCertDir, "tls.key")
+		if _, err := os.Stat(certPath); os.IsNotExist(err) {
+			setupLog.Error(err, "tls.crt not found in cert directory", "path", certPath)
+			os.Exit(1)
+		}
+		if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+			setupLog.Error(err, "tls.key not found in cert directory", "path", keyPath)
+			os.Exit(1)
+		}
+		setupLog.Info("Secure metrics enabled and TLS certificates found, serving metrics over HTTPS")
+	} else {
+		setupLog.Info("Secure metrics disabled, serving metrics over HTTP")
+	}
+	// --- 로직 추가 끝 ---
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme: scheme,
+		Metrics: server.Options{
+			BindAddress:   metricsAddr,
+			SecureServing: secureMetrics, // 이 플래그 값에 따라 HTTP/HTTPS가 결정됨
+			CertDir:       tlsCertDir,
+		},
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		LeaderElectionID:       "tekton-controller.tekton.platform",
+	})
+
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	// ... 나머지 컨트롤러 설정 ...
+	if err = (&controllers.WorkloadReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Workload")
+		os.Exit(1)
+	}
+
+	if err = (&namespace.NamespaceCleanupReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NamespaceCleanup")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	setupLog.Info("starting manager")
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}
+# ----------------------------------------
+# 컨트롤러 개발용 Makefile
+# ----------------------------------------
+export GOPATH := $(shell go env GOPATH)
+
+# --- 변수 정의 ---
+CONTROLLER_GEN_VERSION ?= v0.15.0
+REPO                   ?= harbor-infra.huntedhappy.kro.kr/library/tekton-controller
+IMAGE_TAG              ?= $(shell date +%Y%m%d%H%M)
+IMAGE                  := $(REPO):$(IMAGE_TAG)
+DEPLOY_YAML            ?= deploy/deployment.yaml
+DEPLOY_NAMESPACE       ?= tekton-operator
+DOCKERFILE             := Dockerfile.gen
+
+# --- 바이너리 확인 ---
+.PHONY: ensure-controller-gen
+ensure-controller-gen:
+	@echo "🔧 controller-gen 확인/설치 ($(CONTROLLER_GEN_VERSION))..."
+	@if ! command -v controller-gen >/dev/null 2>&1; then \
+		GO111MODULE=on go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION); \
+	else \
+		echo "✅ controller-gen found: $$(which controller-gen)"; \
+	fi
+
+# --- 코드 품질 ---
+.PHONY: vet
+vet:
+	@echo "🔎 Running go vet..."
+	go vet ./...
+
+# --- Go 모듈 캐시 정리 ---
+.PHONY: prompt-clean-modcache
+prompt-clean-modcache:
+	@read -p "🛉 Do you want to run 'go clean -modcache'? [y/N(Default)]: " answer; \
+	case $$answer in \
+		y|Y) \
+			echo "🛉 Cleaning Go module cache..."; \
+			go clean -modcache; \
+			echo "✅ Done."; \
+			;; \
+		*) \
+			echo "🚫 Skipped 'go clean -modcache'."; \
+			;; \
+	esac
+
+# --- 의존성 관리 ---
+.PHONY: deps-reset
+deps-reset:
+	@echo "💣 Deleting mod files..."
+	@rm -f go.mod go.sum
+	@echo "🔄 Initializing new go.mod..."
+	@go mod init tekton-controller
+	@echo "⬇️  Fetching required core dependencies..."
+	@go get github.com/tektoncd/pipeline@v0.61.0
+	@go get sigs.k8s.io/controller-runtime@v0.21.0
+	@go get k8s.io/client-go@v0.30.2
+	@echo "✨ Running go mod tidy..."
+	@go mod tidy
+	@echo "✅ Dependency reset complete."
+
+# --- 의종성 관리 버전 확인 ---
+	@go list -m github.com/tektoncd/pipeline
+		
+# --- 빌드 & 테스트 ---
+.PHONY: mod-tidy build test test-controllers ci envtest
+mod-tidy:
+	go mod tidy
+
+build: ensure-controller-gen mod-tidy
+	go build ./...
+
+test:
+	go clean -testcache
+	go test ./... -v
+
+test-controllers:
+	go clean -testcache
+	go test ./controllers/... -v
+
+ci: build test vet
+	@echo "✅ Build, Test & Vet passed"
+
+envtest:
+	GO111MODULE=on go test ./... -tags=integration -v
+
+# --- 릴리즈: 이미지 빌드·푸시·배포 ---
+.PHONY: release docker-build docker-push kubernetes-deploy clean
+
+# 메인 릴리즈 타겟
+release: prompt-clean-modcache ci docker-build docker-push kubernetes-deploy
+	@echo "✅ Release complete: image=$(IMAGE)"
+
+# Dockerfile 생성 및 이미지 빌드
+docker-build:
+	@echo "📦 Generating Dockerfile..."
+	@printf '%s\n' \
+		'# Build stage' \
+		'FROM golang:1.24 AS builder' \
+		'' \
+		'WORKDIR /workspace' \
+		'COPY go.mod go.sum ./' \
+		'RUN go mod download' \
+		'' \
+		'COPY . .' \
+		'RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager main.go' \
+		'' \
+		'# Runtime stage' \
+		'FROM debian:bullseye-slim' \
+		'' \
+		'RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*' \
+		'' \
+		'WORKDIR /' \
+		'COPY --from=builder /workspace/manager .' \
+		'' \
+		'USER 65532:65532' \
+		'' \
+		'ENTRYPOINT ["/manager"]' \
+		> $(DOCKERFILE)
+	@echo "🎯 Building image $(IMAGE) from $(DOCKERFILE)..."
+	docker build --no-cache -t $(IMAGE) -f $(DOCKERFILE) .
+
+# Docker 이미지 푸시
+docker-push:
+	@echo "🚀 Pushing image $(IMAGE)..."
+	docker push $(IMAGE)
+
+# 쿠버네티스 배포 (수정된 부분)
+# kubernetes-deploy 타겟 (최종 개선안)
+DEPLOY_NAMESPACE ?= tekton-operator
+
+kubernetes-deploy:
+	@echo "👀 Checking for existing Deployment 'tekton-controller' in namespace '$(DEPLOY_NAMESPACE)'..."
+	@if kubectl get deployment tekton-controller -n $(DEPLOY_NAMESPACE) >/dev/null 2>&1; then \
+		echo "🛠️  Deployment exists, updating image to $(IMAGE)..."; \
+		kubectl -n $(DEPLOY_NAMESPACE) set image deployment/tekton-controller tekton-controller=$(IMAGE); \
+	else \
+		if [ -f "$(DEPLOY_YAML)" ]; then \
+			echo "🆕 Deployment not found, applying temporary manifest with new image tag..."; \
+			cat $(DEPLOY_YAML) | sed 's|image: .*|image: $(IMAGE)|g' | kubectl apply -f -; \
+		else \
+			echo "‼️ Error: Deployment manifest '$(DEPLOY_YAML)' not found."; \
+			exit 1; \
+		fi \
+	fi
+
+# 빌드 결과물 정리
+clean:
+	@echo "🪟 Cleaning build artifacts..."
+	@rm -f manager $(DOCKERFILE)
+	@go clean -testcache
+	@echo "🪟 Cleaning Docker image: $(IMAGE)..."
+	@docker rmi $(IMAGE) 2>/dev/null || true

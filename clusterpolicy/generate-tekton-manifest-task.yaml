@@ -1,0 +1,379 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-manifest-task-policy
+spec:
+  generateExisting: true
+  background: true
+  rules:
+  - name: generate-tekton-manifest-task-rule
+    match:
+      resources:
+        kinds: ["Namespace"]
+        selector:
+          matchLabels:
+            tekton-enabled: "true"
+    generate:
+      apiVersion: tekton.dev/v1
+      kind: Task
+      name: generate-manifest
+      namespace:  "{{ request.object.metadata.name }}"
+      synchronize: true
+      data:
+        apiVersion: tekton.dev/v1
+        kind: Task
+        metadata:
+          name: generate-manifest
+          namespace:  "{{ request.object.metadata.name }}"
+        spec:
+          description: |
+            빌드된 이미지를 기준으로 manifest 스켈레톤(deployment+service+ingress)을
+            지정 브랜치에 생성·커밋·푸시하고, 필요 시 MR/Merge를 수행합니다.
+          workspaces:
+            - name: source
+          params:
+            - name: IMAGE_REPO
+              type: string
+              description: "생성된 이미지 (registry/path:tag)"
+            - name: CI_GIT_PROJECT_NAME
+              type: string
+            - name: GITOPS_BRANCH
+              type: string
+              description: "작업을 수행할 브랜치 이름 (ex. main, dev)"
+            - name: GITOPS_COMMIT_BRANCH
+              type: string
+              description: "Merge Request의 대상이 될 브랜치 이름 (ex. main)"
+            - name: GITOPS_SERVER_ADDRESS
+              type: string
+            - name: GITOPS_REPOSITORY_NAME
+              type: string
+            - name: GITOPS_REPOSITORY_OWNER
+              type: string
+            - name: GITOPS_SKIP_MR
+              type: string
+              default: "false"
+            - name: INGRESSCLASSNAME
+              type: string
+              default: "nginx"
+            - name: GITOPS_SSH_SECRET
+              type: string
+              description: "GitOps 저장소에 접근하기 위한 username/password를 담은 Secret 이름"
+            - name: WORKLOADNAME
+              type: string
+            - name: DOMAIN
+              type: string
+            - name: RESOURCES
+              type: string
+            - name: HPA
+              type: string
+          steps:
+          - name: generate-and-push
+            image: alpine/helm:3.14.0
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            env:
+              - name: USERNAME
+                valueFrom:
+                  secretKeyRef:
+                    name: '\$(params.GITOPS_SSH_SECRET)'
+                    key: username
+              - name: PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: '\$(params.GITOPS_SSH_SECRET)'
+                    key: password
+            script: |
+              #!/usr/bin/env sh
+              set -eux
+
+              apk add --no-cache git curl yq jq
+
+              if [ -z "\$(params.GITOPS_BRANCH)" ] || [ -z "\$(params.GITOPS_REPOSITORY_NAME)" ] || [ -z "\$(params.WORKLOADNAME)" ]; then
+                echo "Error: Required parameters are empty."
+                exit 1
+              fi
+
+              cd "\$(workspaces.source.path)"
+              echo "[init] Cleaning workspace for fresh clone..."
+              find . -mindepth 1 -delete
+
+              RAW_URL="\$(params.GITOPS_SERVER_ADDRESS)"
+              REPO_PATH="\$(params.GITOPS_REPOSITORY_NAME)"
+              REPO_OWNER="\$(params.GITOPS_REPOSITORY_OWNER)"
+              HOST_ONLY=$(echo "$RAW_URL" | sed 's|https://||')
+              GIT_URL_WITH_CRED="https://${USERNAME}:${PASSWORD}@${HOST_ONLY}/${REPO_OWNER}/${REPO_PATH}.git"
+
+              echo "[git] Cloning repo into workspace..."
+              git clone --depth 1 "$GIT_URL_WITH_CRED" .
+              git config --global --add safe.directory "\$(workspaces.source.path)"
+              git config user.name "${USERNAME}"
+              git config user.email "${USERNAME}@example.com"
+
+              TARGET_BRANCH="\$(params.GITOPS_BRANCH)"
+              if git ls-remote --exit-code --heads origin "$TARGET_BRANCH"; then
+                echo "Branch '${TARGET_BRANCH}' exists on remote. Fetching and checking it out."
+                git fetch origin "$TARGET_BRANCH":"$TARGET_BRANCH" # <-- Add this line to fetch the specific branch
+                git checkout "$TARGET_BRANCH"
+              else
+                echo "Branch '${TARGET_BRANCH}' does not exist on remote. Creating and pushing it."
+                git checkout -b "$TARGET_BRANCH"
+                git push -u origin "$TARGET_BRANCH"
+              fi
+
+              echo "[helm] Removing old manifests and helm directories"
+              rm -rf manifests helm
+              mkdir -p manifests
+
+              PROJECT_NAME="\$(params.CI_GIT_PROJECT_NAME)"
+              WORKLOAD_NAME="\$(params.WORKLOADNAME)"
+              REPO=$(echo "\$(params.IMAGE_REPO)" | cut -d ':' -f1)
+              TAG=$(echo "\$(params.IMAGE_REPO)" | cut -d ':' -f2)
+              VALUES_FILE=helm\/$WORKLOAD_NAME-values.yaml
+
+              echo "[helm] Creating Helm Chart: $PROJECT_NAME"
+              # [수정] 차트 생성 후 파일 이동 로직으로 수정하여 경로 문제 해결
+              mkdir -p helm
+              helm create "$PROJECT_NAME"
+              mv "$PROJECT_NAME"/* helm/
+              rm -rf "$PROJECT_NAME"
+
+              echo "[helm] Modifying deployment and service templates"
+              sed -i 's/port: 80/port: 8080/' helm/templates/deployment.yaml
+              sed -i 's/targetPort: 80/targetPort: 8080/' helm/templates/deployment.yaml
+              sed -i 's/containerPort: 80/containerPort: 8080/' helm/templates/deployment.yaml
+              sed -i 's/name: http/name: web/; s/targetPort: http/targetPort: 8080/' helm/templates/service.yaml
+
+              # deployment.yaml 에 env-block 삽입
+              sed -i '/^ *containers:/a\
+                        \{{- if .Values.env }}\
+                        env:\
+                        \{{- range .Values.env }}\
+                        - name:  \{{ index (splitList "=" .) 0 }}\
+                          value: \{{ index (splitList "=" .) 1 }}\
+                        \{{- end }}\
+                        \{{- end }}' helm/templates/deployment.yaml
+
+              cat > helm/templates/hpa.yaml <<EOF
+              # templates/hpa.yaml
+              \{{- if .Values.autoscaling.enabled }}
+              apiVersion: autoscaling/v2
+              kind: HorizontalPodAutoscaler
+              metadata:
+                name: \{{ include "$WORKLOAD_NAME.fullname" . }}
+                labels:
+                  \{{- include "$WORKLOAD_NAME.labels" . | nindent 4 }}
+              spec:
+                scaleTargetRef:
+                  apiVersion: apps/v1
+                  kind: Deployment # Or StatefulSet, etc.
+                  name: \{{ include "$WORKLOAD_NAME.fullname" . }}
+                minReplicas: \{{ .Values.autoscaling.minReplicas }}
+                maxReplicas: \{{ .Values.autoscaling.maxReplicas }}
+                metrics:
+                  \{{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+                  - type: Resource
+                    resource:
+                      name: cpu
+                      target:
+                        type: Utilization
+                        averageUtilization: \{{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+                  \{{- end }}
+                  \{{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+                  - type: Resource
+                    resource:
+                      name: memory
+                      target:
+                        type: Utilization
+                        averageUtilization: \{{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+                  \{{- end }}
+                  # If you chose the more generic 'metrics' list in values.yaml:
+                  \{{- /*
+                  \{{- if .Values.autoscaling.metrics }}
+                  \{{- toYaml .Values.autoscaling.metrics | nindent 4 }}
+                  \{{- end }}
+                  \*/}}
+              \{{- end }}
+              EOF
+
+              # Ingress 템플릿 추가
+              cat > helm/templates/ingress.yaml <<EOF
+              \{{- if .Values.ingress.enabled }}
+              apiVersion: networking.k8s.io/v1
+              kind: Ingress
+              metadata:
+                name: \{{ include "$WORKLOAD_NAME.fullname" . }}
+                annotations:
+                  \{{- toYaml .Values.ingress.annotations | nindent 4 }}
+              spec:
+                ingressClassName: \{{ .Values.ingress.className }}
+                rules:
+                  - host: \{{ .Values.ingress.host }}
+                    http:
+                      paths:
+                        - path: /
+                          pathType: Prefix
+                          backend:
+                            service:
+                              name: \{{ include "$WORKLOAD_NAME.fullname" . }}
+                              port:
+                                number: \{{ .Values.service.port }}
+                \{{- if .Values.ingress.tls }}
+                tls:
+                  - hosts:
+                      - \{{ .Values.ingress.host }}
+                    secretName: \{{ .Values.ingress.tlsSecret }}
+                \{{- end }}
+              \{{- end }}
+              EOF
+
+              # PVC 템플릿 추가
+              cat > helm/templates/pvc.yaml <<EOF
+              \{{- if and .Values.persistence (hasKey .Values.persistence "enabled") }}
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: \{{ include "$WORKLOAD_NAME.fullname" . }}-data
+              spec:
+                accessModes:
+                  - \{{ .Values.persistence.accessMode }}
+                resources:
+                  requests:
+                    storage: \{{ .Values.persistence.size }}
+              \{{- end }}
+              EOF
+
+              # values 파일 작성
+              cat > $VALUES_FILE <<EOF
+              image:
+                repository: "$REPO"
+                tag: "$TAG"
+                pullPolicy: IfNotPresent
+
+              service:
+                port: 8080
+                targetPort: 8080
+
+              ingress:
+                enabled: true
+                className: "\$(params.INGRESSCLASSNAME)"
+                host: "$WORKLOAD_NAME.\$(params.DOMAIN)"
+                tls: true
+                tlsSecret: "$WORKLOAD_NAME-tls"
+                annotations:
+                  nginx.ingress.kubernetes.io/rewrite-target: /
+
+              persistence:
+                enabled: true
+                accessMode: ReadWriteOnce
+                size: 1Gi
+              EOF
+
+              # 2) resources 파라미터 raw
+              RAW_RES="\$(params.RESOURCES)"
+              
+
+              if [ -n "$RAW_RES" ] && [ "$RAW_RES" != "false" ] && [ "$RAW_RES" != "{}" ]; then
+                # 2) resources 블록 헤더
+                cat >> $VALUES_FILE <<EOF
+
+              resources:
+              EOF
+
+                # 3) resources JSON→YAML, 두 칸 들여쓰기
+                printf '%s\n' "\$(params.RESOURCES)" \
+                  | sed -E 's/([a-zA-Z0-9_]+):/"\1":/g; s/:([a-zA-Z0-9_]+)/:"\1"/g' \
+                  | yq eval -P --input-format=json -I=2 -o=yaml - \
+                  | sed 's/^/  /' \
+                  >> "$VALUES_FILE"
+              fi
+
+              RAW_HPA="\$(params.HPA)"
+              
+              # HPA 값이 없거나 "false"이면 아무것도 하지 않음
+              if [ -z "$RAW_HPA" ] || [ "$RAW_HPA" = "false" ]; then
+                echo "Skipping HPA configuration (RAW_HPA is empty or false)"
+              else
+                # JSON 형태로 변환 (key에 따옴표 추가)
+                HPA_JSON=$(printf '%s' "$RAW_HPA" | sed -E 's/([A-Za-z0-9_]+):/"\1":/g')
+              
+                ENABLED=$(printf '%s\n' "$HPA_JSON" | yq eval '.enabled' -)
+              
+                if [ "$ENABLED" = "true" ]; then
+                  # hpa 블록 헤더
+                  cat >> "$VALUES_FILE" <<EOF
+              
+              autoscaling:
+              EOF
+                  
+                  # hpa JSON → YAML (2칸 들여쓰기)
+                  printf '%s\n' "\$(params.HPA)" \
+                    | sed -E 's/([a-zA-Z0-9_]+):/"\1":/g' \
+                    | yq eval -P --input-format=json -I=2 -o=yaml - \
+                    | sed 's/^/  /' \
+                    >> "$VALUES_FILE"
+                fi
+              fi
+
+              # 6) 결과 확인 (선택)
+              echo "--- values.yaml ---"
+              cat "$VALUES_FILE"
+
+              echo "[helm] Templating manifests..."
+              # [버그 수정] -f 플래그로 values.yaml 파일을 명시적으로 사용
+              helm template "$PROJECT_NAME" ./helm -f helm/values.yaml > manifests/all.yaml
+
+              echo "[git] Committing and pushing changes..."
+              git add manifests/ helm/
+              
+              if ! git diff --cached --quiet; then
+                git commit -m "ci: update manifests for image \$(params.IMAGE_REPO)"
+                git push origin "${TARGET_BRANCH}"
+              else
+                echo "[git] No changes detected. Skipping commit and push."
+                exit 0
+              fi
+
+              # GITOPS_SKIP_MR이 true인 경우 자동 merge 수행
+              if [ "\$(params.GITOPS_SKIP_MR)" = "true" ]; then
+                echo "Merge Request 생략, 대신 자동 merge 수행"
+                git fetch origin "\$(params.GITOPS_BRANCH)"
+                git checkout "\$(params.GITOPS_BRANCH)"
+                git merge "\$(params.GITOPS_COMMIT_BRANCH)" --no-edit
+                git push origin "\$(params.GITOPS_BRANCH)"
+                exit 0
+              fi
+
+              CLEAN_URL=$(echo "\$(params.GITOPS_SERVER_ADDRESS)" | sed 's#/*$##')
+              ENCODED_REPO_PATH=$(echo "\$(params.GITOPS_REPOSITORY_NAME)" | sed 's#/#%2F#g')
+              ENCODED_REPO_OWNER=$(echo "\$(params.GITOPS_REPOSITORY_OWNER)" | sed 's#/#%2F#g')
+
+              cat <<EOF > body.json
+              {
+                "source_branch": "\$(params.GITOPS_BRANCH)",
+                "target_branch": "\$(params.GITOPS_COMMIT_BRANCH)",
+                "title": "CI: Update manifest for \$(params.IMAGE_REPO)"
+              }
+              EOF
+
+              echo "MR curl 명령 디버깅:"
+              echo "curl -X POST ${CLEAN_URL}/api/v4/projects/${ENCODED_REPO_OWNER}/${ENCODED_REPO_PATH}/merge_requests"
+              echo "     --header 'PRIVATE-TOKEN: ${PASSWORD}'"
+              echo "     --data @body.json"
+
+              RESPONSE=$(curl -s -w "\nHTTP %{http_code}" -X POST "${CLEAN_URL}/api/v4/projects/${ENCODED_REPO_OWNER}/${ENCODED_REPO_PATH}/merge_requests" \
+                --header "PRIVATE-TOKEN: ${PASSWORD}" \
+                --header "Content-Type: application/json" \
+                --data @body.json)
+
+              HTTP_STATUS=$(echo "$RESPONSE" | tail -n1 | awk '{print $2}')
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              echo "MR 요청 결과 (HTTP $HTTP_STATUS):"
+              echo "$BODY"
+
+              if [ "$HTTP_STATUS" -ne 201 ]; then
+                echo "Merge Request 생성 실패"
+                exit 1
+              fi
+              echo "Merge Request successfully created."

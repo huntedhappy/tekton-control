@@ -1,0 +1,432 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-tekton-pipeline-private-policy
+spec:
+  generateExisting: true
+  background: true
+  rules:
+    - name: generate-tekton-pipeline-private-rule
+      match:
+        resources:
+          kinds: ["Workload"]
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.params[?(@.name=='buildServiceBindings')].value | [0] }}"
+            operator: NotEquals
+            value: ""          
+      generate:
+        apiVersion: tekton.dev/v1
+        kind: Pipeline
+        name: master-ci-pipeline-private
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        data:
+          apiVersion: tekton.dev/v1
+          kind: Pipeline
+          metadata:
+            name: master-ci-pipeline-private
+            namespace: "{{ request.object.metadata.namespace }}"
+          spec:
+            params:
+              - name: ci-git-revision
+                type: string
+                description: "The full Git commit SHA for the current build"
+              - name: ci-git-branch
+                type: string
+              - name: ci-git-url
+                type: string
+              - name: ci-git-repo-path
+                type: string
+              - name: ci-git-project-name
+                type: string
+              - name: cache_image_url
+                type: string
+                description: "URL for the build cache image"
+                default: "harbor-infra.huntedhappy.kro.kr/library/build-cache:latest"
+              - name: buildServiceBindings
+                type: string
+                default: ""
+              - name: gitops-skip-mr
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops-skip-mr')].value | [0] }}"
+              - name: gitops_server_address
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_server_address')].value | [0] }}"
+              - name: gitops_branch
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_branch')].value | [0] }}"
+              - name: gitops_repository_name
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_repository_name')].value | [0] }}"
+              - name: gitops_repository_owner
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_repository_owner')].value | [0] }}"
+              - name: gitops_user_email
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_user_email')].value | [0] }}"
+              - name: gitops_commit_message
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_commit_message')].value | [0] }}"
+              - name: gitops_ssh_secret
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_ssh_secret')].value | [0] }}"
+              - name: gitops_commit_branch
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_commit_branch')].value | [0] }}"
+              - name: gitops_server_kind
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_server_kind')].value | [0] }}"
+              - name: gitops_pull_request_title
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_pull_request_title')].value | [0] }}"
+              - name: gitops_pull_request_body
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='gitops_pull_request_body')].value | [0] }}"
+              - name: workloadname
+                type: string
+                default:
+                  "{{ request.object.metadata.name }}"
+              - name: image_repo_address
+                type: string
+                description: "The image registry address (e.g., my-registry.io)"
+                default:
+                  "{{ request.object.spec.params[?(@.name=='image_repo_address')].value | [0] }}"
+              - name: image_repo_path
+                type: string
+                description: "The path or project within the registry (e.g., my-project)"
+                default:
+                  "{{ request.object.spec.params[?(@.name=='image_repo_path')].value | [0] }}"
+              - name: ingressclassname
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='ingressclassname')].value | [0] }}"
+              - name: dockerfile
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='dockerfile')].value[0] || '' }}"
+              - name: submodules
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='submodules')].value | [0] }}"
+              - name: domain
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='domain')].value | [0] }}"
+              - name: clusterBuilder
+                type: string
+                default:
+                  "{{ request.object.spec.params[?(@.name=='clusterBuilder')].value | [0] }}"
+              - name: build_workspace_claim
+                type: string
+                default:
+                  "{{ request.object.metadata.annotations.\"tekton.platform/build_workspace_claim\" | 'shared-data' }}"
+              - name: build_git_secret
+                type: string
+                default:
+                  "{{ request.object.metadata.annotations.\"tekton.platform/build_git_secret\" | 'git-credentials' }}"
+              - name: resources
+                type: string
+                description: Resources
+                default:
+                  "{{ request.object.spec[?(@.resources)] || 'false' }}"
+              - name: hpa
+                type: string
+                description: JSON array of all requests cpu
+                default:
+                  "{{ request.object.spec[?(@.autoscaling)] || 'false' }}"
+              - name: build_env_name
+                type: array
+                description: "Build-time environment variables"
+                default:
+                  "{{ request.object.spec.build.env || 'JAVA_TOOL_OPTIONS=-Dmanagement.health.probes.enabled=\"false\" -Djava.security.properties=/layers/.../java-security.properties -XX:+ExitOnOutOfMemoryError -XX:ActiveProcessorCount=8 -XX:MaxDirectMemorySize=10M -Xmx4191438K -XX:MaxMetaspaceSize=72549K -XX:ReservedCodeCacheSize=240M -Xss1M -XX:+UnlockDiagnosticVMOptions -XX:NativeMemoryTracking=summary -XX:+PrintNMTStatistics -Dorg.springframework.cloud.bindings.boot.enable=true' }}"
+                 # - "{{ request.object.spec.build.env[0].name }}={{ request.object.spec.build.env[0].value }}"
+                 # - "{{ request.object.spec.build.env[1].name }}={{ request.object.spec.build.env[1].value }}"
+                 # - "{{ request.object.spec.build.env[2].name }}={{ request.object.spec.build.env[2].value }}"
+                 # - "{{ request.object.spec.build.env[3].name }}={{ request.object.spec.build.env[3].value }}"
+              - name: SKIP_TLS_VERIFY
+                default: "false"
+            workspaces:
+              - name: shared-data
+              - name: git-credentials
+              - name: settings-xml
+              - name: cache-data
+            tasks:
+              - name: fetch-source
+                taskRef:
+                  name: git-clone
+                  kind: Task
+                params:
+                  - name: url
+                    value: '\$(params.ci-git-url)'
+                  - name: revision
+                    value: '\$(params.ci-git-revision)'
+                  - name: submodules
+                    value: '\$(params.submodules)'
+                  - name: sslVerify
+                    value: "false"
+                workspaces:
+                  - name: output
+                    workspace: shared-data
+
+              - name: build-with-buildkit
+                runAfter:
+                  - fetch-source
+                when:
+                  - input: '\$(params.dockerfile)'
+                    operator: in
+                    values: ["./Dockerfile"]
+                taskRef:
+                  name: buildkit
+                  kind: Task
+                params:
+                  - name: IMAGE
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: CONTEXT
+                    value: .
+                  - name: DOCKERFILE
+                    value: '\$(params.dockerfile)'
+                  - name: EXTRA_ARGS
+                    value:
+                      - --skip-insecure-entitlement
+                workspaces:
+                  - name: source
+                    workspace: shared-data
+
+              - name: build-default-with-nexus-for-buildpacks
+                runAfter:
+                  - fetch-source
+                when:
+                  - input: '\$(params.dockerfile)'
+                    operator: notin
+                    values: ["./Dockerfile"]
+                  - input: '\$(params.buildServiceBindings)'
+                    operator: in
+                    values: ['\$(params.buildServiceBindings)']
+                  - input: '\$(params.clusterBuilder)'
+                    operator: in
+                    values: ["default"]
+                taskRef:
+                  name: buildpacks
+                  kind: Task
+                params:
+                  - name: APP_IMAGE
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: BUILDER_IMAGE
+                    value: gcr.io/buildpacks/builder:v1
+                  - name: CACHE_IMAGE
+                    value: '\$(params.cache_image_url)'
+                  - name: ENV_VARS
+                    value:
+                      - BP_MAVEN_SETTINGS_PATH=/workspace/settings-xml/settings.xml
+                      - BP_LOG_LEVEL=DEBUG
+                workspaces:
+                  - name: source
+                    workspace: shared-data
+                  - name: settings-xml
+                    workspace: settings-xml
+
+              - name: build-base-with-nexus-for-buildpacks
+                runAfter:
+                  - fetch-source
+                when:
+                  - input: '\$(params.dockerfile)'
+                    operator: notin
+                    values: ["./Dockerfile"]
+                  - input: '\$(params.buildServiceBindings)'
+                    operator: in
+                    values: ['\$(params.buildServiceBindings)']
+                  - input: '\$(params.clusterBuilder)'
+                    operator: in
+                    values: ["base"]
+                taskRef:
+                  name: buildpacks
+                  kind: Task
+                params:
+                  - name: APP_IMAGE
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: BUILDER_IMAGE
+                    value: paketobuildpacks/builder:base
+                  #- name: CACHE_IMAGE
+                  #  value: '\$(params.cache_image_url)'
+                  - name: ENV_VARS
+                    value: '\$(params.build_env_name[*])'
+                workspaces:
+                  - name: source
+                    workspace: shared-data
+                  - name: cache
+                    workspace: cache-data
+                  - name: settings-xml
+                    workspace: settings-xml
+
+              - name: build-full-with-nexus-for-buildpacks
+                runAfter:
+                  - fetch-source
+                when:
+                  - input: '\$(params.dockerfile)'
+                    operator: notin
+                    values: ["./Dockerfile"]
+                  - input: '\$(params.buildServiceBindings)'
+                    operator: in
+                    values: ['\$(params.buildServiceBindings)']
+                  - input: '\$(params.clusterBuilder)'
+                    operator: in
+                    values: ["full"]
+                taskRef:
+                  name: buildpacks
+                  kind: Task
+                params:
+                  - name: APP_IMAGE
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: BUILDER_IMAGE
+                    value: paketobuildpacks/builder:full
+                  - name: CACHE_IMAGE
+                    value: '\$(params.cache_image_url)'
+                  - name: ENV_VARS
+                    value:
+                      - BP_MAVEN_SETTINGS_PATH=/workspace/settings-xml/settings.xml
+                      - BP_LOG_LEVEL=DEBUG
+                workspaces:
+                  - name: source
+                    workspace: shared-data
+                  - name: settings-xml
+                    workspace: settings-xml
+
+              - name: build-default-without-nexus-for-buildpacks
+                runAfter:
+                  - fetch-source
+                when:
+                  - input: '\$(params.dockerfile)'
+                    operator: notin
+                    values: ["./Dockerfile"]
+                  - input: '\$(params.buildServiceBindings)'
+                    operator: in
+                    values: ["false"]
+                  - input: '\$(params.clusterBuilder)'
+                    operator: in
+                    values: ["default"]
+                taskRef:
+                  name: buildpacks
+                  kind: Task
+                params:
+                  - name: APP_IMAGE
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: BUILDER_IMAGE
+                    value: gcr.io/buildpacks/builder:v1
+                  - name: CACHE_IMAGE
+                    value: '\$(params.cache_image_url)'
+                workspaces:
+                  - name: source
+                    workspace: shared-data
+
+              - name: build-base-without-nexus-for-buildpacks
+                runAfter:
+                  - fetch-source
+                when:
+                  - input: '\$(params.dockerfile)'
+                    operator: notin
+                    values: ["./Dockerfile"]
+                  - input: '\$(params.buildServiceBindings)'
+                    operator: in
+                    values: ["false"]
+                  - input: '\$(params.clusterBuilder)'
+                    operator: in
+                    values: ["base"]
+                taskRef:
+                  name: buildpacks
+                  kind: Task
+                params:
+                  - name: APP_IMAGE
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: BUILDER_IMAGE
+                    value: paketobuildpacks/builder:base
+                  - name: CACHE_IMAGE
+                    value: '\$(params.cache_image_url)'
+                workspaces:
+                  - name: source
+                    workspace: shared-data
+
+              - name: build-full-without-nexus-for-buildpacks
+                runAfter:
+                  - fetch-source
+                when:
+                  - input: '\$(params.dockerfile)'
+                    operator: notin
+                    values: ["./Dockerfile"]
+                  - input: '\$(params.buildServiceBindings)'
+                    operator: in
+                    values: ["false"]
+                  - input: '\$(params.clusterBuilder)'
+                    operator: in
+                    values: ["full"]
+                taskRef:
+                  name: buildpacks
+                  kind: Task
+                params:
+                  - name: APP_IMAGE
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: BUILDER_IMAGE
+                    value: paketobuildpacks/builder:full
+                  - name: CACHE_IMAGE
+                    value: '\$(params.cache_image_url)'
+                workspaces:
+                  - name: source
+                    workspace: shared-data
+
+              - name: generate-manifest
+                runAfter:
+                  - build-with-buildkit
+                  - build-default-with-nexus-for-buildpacks
+                  - build-base-with-nexus-for-buildpacks
+                  - build-full-with-nexus-for-buildpacks
+                  - build-default-without-nexus-for-buildpacks
+                  - build-base-without-nexus-for-buildpacks
+                  - build-full-without-nexus-for-buildpacks
+                taskRef:
+                  name: generate-manifest
+                  kind: Task
+                params:
+                  - name: IMAGE_REPO
+                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
+                  - name: CI_GIT_PROJECT_NAME
+                    value: '\$(params.ci-git-project-name)'
+                  - name: GITOPS_SERVER_ADDRESS
+                    value: '\$(params.gitops_server_address)'
+                  - name: GITOPS_BRANCH
+                    value: '\$(params.gitops_branch)'
+                  - name: GITOPS_COMMIT_BRANCH
+                    value: '\$(params.gitops_commit_branch)'
+                  - name: GITOPS_REPOSITORY_NAME
+                    value: '\$(params.gitops_repository_name)'
+                  - name: GITOPS_REPOSITORY_OWNER
+                    value: '\$(params.gitops_repository_owner)'
+                  - name: WORKLOADNAME
+                    value: '\$(params.workloadname)'
+                  - name: DOMAIN
+                    value: '\$(params.domain)'
+                  - name: INGRESSCLASSNAME
+                    value: '\$(params.ingressclassname)'
+                  - name: GITOPS_SKIP_MR
+                    value: '\$(params.gitops-skip-mr)'
+                  - name: GITOPS_SSH_SECRET
+                    value: '\$(params.gitops_ssh_secret)'
+                  - name: RESOURCES
+                    value: \$(params.resources)
+                  - name: HPA
+                    value: \$(params.hpa)
+                workspaces:
+                  - name: source
+                    workspace: shared-data

@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: settings-xml
+type: service.binding/maven
+stringData:
+  type: maven
+  provider: sample
+  settings.xml: |
+    <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+       <mirrors>
+           <mirror>
+               <id>repository</id>
+               <name>Tanzu seal Internal Repo</name>
+               <url>https://repo.huntedhappy.kro.kr/repository/maven-public\</url\>
+               <mirrorOf>*</mirrorOf>
+           </mirror>
+       </mirrors>
+       <servers>
+           <server>
+               <id>repositorysite</id>
+               <username>admin</username>
+               <password>Openbase!234</password>
+               <configuration></configuration>
+           </server>
+       </servers>
+        <pluginGroups>
+            <pluginGroup>org.sonarsource.scanner.maven</pluginGroup>
+        </pluginGroups>
+        <profiles>
+            <profile>
+                <id>tanzu-tap.public</id>
+                <activation>
+                    <activeByDefault>true</activeByDefault>
+                </activation>
+                <repositories>
+                    <repository>
+                        <id>codehausSnapshots</id>
+                        <name>Codehaus Snapshots</name>
+                        <url>https://repo.huntedhappy.kro.kr/repository/maven-public/\</url\>
+                        <releases>
+                            <enabled>true</enabled>
+                            <updatePolicy>always</updatePolicy>
+                        </releases>
+                        <snapshots>
+                            <enabled>true</enabled>
+                            <updatePolicy>always</updatePolicy>
+                        </snapshots>
+                        <layout>default</layout>
+                    </repository>
+                </repositories>
+                <pluginRepositories>
+                    <pluginRepository>
+                        <id>myPluginRepo</id>
+                        <name>My Plugins repo</name>
+                        <url>>https://repo.huntedhappy.kro.kr/repository/maven-public/\</url\>
+                        <releases>
+                            <enabled>true</enabled>
+                            <updatePolicy>always</updatePolicy>
+                        </releases>
+                        <snapshots>
+                            <enabled>true</enabled>
+                            <updatePolicy>always</updatePolicy>
+                        </snapshots>
+                    </pluginRepository>
+                </pluginRepositories>
+            </profile>
+            <profile>
+                <id>sonar</id>
+                <activation>
+                    <activeByDefault>true</activeByDefault>
+                </activation>
+                <properties>
+                    <sonar.login>
+                      sqp_ff311e292b52cc82ae940568ed61e3a4c23186db
+                    </sonar.login>
+                    <sonar.host.url>
+                      https://sonarqube.huntedhappy.kro.kr
+                    </sonar.host.url>
+                    <sonar.projectKey>
+                      tanzu-java-web-app
+                    </sonar.projectKey>
+                </properties>
+            </profile>
+         </profiles>
+    </settings>
