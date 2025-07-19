@@ -77,7 +77,7 @@ func NewPipelineRun(ctx context.Context, wl *tektonv1alpha1.Workload, gitInfo gi
 			GenerateName: wl.GetName() + "-pr-",
 			Namespace:    wl.GetNamespace(),
 			Labels: map[string]string{
-				"workload": wl.Name, // Workload 식별 라벨 추가
+				"workload": wl.Name, // Workload 라벨 추가
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(wl, tektonv1alpha1.GroupVersion.WithKind("Workload")),
@@ -87,7 +87,7 @@ func NewPipelineRun(ctx context.Context, wl *tektonv1alpha1.Workload, gitInfo gi
 			PipelineRef:        &pipelinev1beta1.PipelineRef{Name: pipelineName},
 			Params:             params,
 			Workspaces:         workspaces,
-			ServiceAccountName: serviceAccount, // SA 설정
+			ServiceAccountName: serviceAccount,
 		},
 	}, nil
 }

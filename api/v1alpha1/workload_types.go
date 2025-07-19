@@ -74,6 +74,8 @@ type WorkloadStatus struct {
 	LastPipelineRunStartTime      *metav1.Time       `json:"lastPipelineRunStartTime,omitempty"`
 	LastPipelineRunCompletionTime *metav1.Time       `json:"lastPipelineRunCompletionTime,omitempty"`
 	ArtifactImage                 string             `json:"artifactImage,omitempty"`
+	CreateCount                   int64              `json:"createCount,omitempty"` // 생성 횟수
+	UpdateCount                   int64              `json:"updateCount,omitempty"` // 업데이트 횟수
 	Conditions                    []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
@@ -81,6 +83,8 @@ type WorkloadStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Pipeline",type="string",JSONPath=".status.pipelineRunStatus"
 // +kubebuilder:printcolumn:name="Image",type="string",JSONPath=".status.artifactImage"
+// +kubebuilder:printcolumn:name="Created",type="integer",JSONPath=".status.createCount"
+// +kubebuilder:printcolumn:name="Updated",type="integer",JSONPath=".status.updateCount"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
 // +kubebuilder:printcolumn:name="Reason",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].reason"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"

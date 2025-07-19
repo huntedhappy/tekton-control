@@ -167,7 +167,7 @@ spec:
                         fsGroup: 0
                     serviceAccountName: pipeline
                   pipelineRef:
-                    name: master-ci-pipeline-private
+                    name: master-ci-pipeline
                   params:
                     - name: ci-git-revision
                       value: '\$(tt.params.ci-git-revision)'

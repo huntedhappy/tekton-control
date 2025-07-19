@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -81,24 +82,35 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Sync PipelineRun status
+	// Sync PipelineRun status (update Workload.Status)
 	if err := r.syncPipelineRunStatus(ctx, &wl); err != nil {
 		logger.Error(err, "Failed to sync PipelineRun status")
 	}
 
-	// Check if current Generation is already handled
-	if wl.Status.ObservedGeneration == wl.Generation && wl.Status.LastPipelineRun != "" {
-		logger.Info("Current generation already processed. Skipping PipelineRun creation.",
-			"workload", wl.Name, "generation", wl.Generation, "lastPR", wl.Status.LastPipelineRun)
-		return ctrl.Result{}, nil
+	// ---------------------------
+	// 생성 vs 업데이트 이벤트 구분
+	// ---------------------------
+	if wl.Status.LastPipelineRun == "" {
+		// Workload 최초 생성 시
+		wl.Status.CreateCount++ // 생성 카운트 증가
+		logger.Info("Detected new Workload. Creating first PipelineRun.", "workload", wl.Name, "createCount", wl.Status.CreateCount)
+		return r.createPipelineRun(ctx, &wl)
 	}
 
-	// Mark ObservedGeneration before PR creation to prevent duplicate creation
-	wl.Status.ObservedGeneration = wl.Generation
-	if err := r.Status().Update(ctx, &wl); err != nil {
-		logger.Error(err, "Failed to mark ObservedGeneration before PipelineRun creation")
-		return ctrl.Result{}, err
+	if wl.Generation > wl.Status.ObservedGeneration {
+		// Workload Spec 업데이트 시
+		wl.Status.UpdateCount++ // 업데이트 카운트 증가
+		logger.Info("Detected Workload update. Creating new PipelineRun.", "workload", wl.Name, "updateCount", wl.Status.UpdateCount)
+		return r.createPipelineRun(ctx, &wl)
 	}
+
+	// 그 외 이벤트 (상태 변경 등)
+	logger.Info("No changes detected. Skipping PipelineRun creation.", "workload", wl.Name)
+	return ctrl.Result{}, nil
+}
+
+func (r *WorkloadReconciler) createPipelineRun(ctx context.Context, wl *tektonv1alpha1.Workload) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
 	// Resolve latest Git SHA
 	repoURL := wl.Spec.Source.Git.URL
@@ -106,7 +118,8 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if branch == "" {
 		branch = "main"
 	}
-	auth, err := r.getGitAuth(ctx, wl.Namespace, util.GetAnnotationOrDefault(&wl, "tekton.platform/build_git_secret", "git-credentials"))
+	auth, err := r.getGitAuth(ctx, wl.Namespace,
+		util.GetAnnotationOrDefault(wl, "tekton.platform/build_git_secret", "git-credentials"))
 	if err != nil {
 		logger.Error(err, "Failed to get Git auth from secret")
 		return ctrl.Result{}, err
@@ -130,11 +143,11 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Extract annotations
-	gitSecret := util.GetAnnotationOrDefault(&wl, "tekton.platform/build_git_secret", "git-credentials")
-	workspaceClaim := util.GetAnnotationOrDefault(&wl, "tekton.platform/build_workspace_claim", "shared-data")
+	gitSecret := util.GetAnnotationOrDefault(wl, "tekton.platform/build_git_secret", "git-credentials")
+	workspaceClaim := util.GetAnnotationOrDefault(wl, "tekton.platform/build_workspace_claim", "shared-data")
 
 	// Create new PipelineRun
-	pr, err := pipeline.NewPipelineRun(ctx, &wl, gitInfo, gitSecret, workspaceClaim)
+	pr, err := pipeline.NewPipelineRun(ctx, wl, gitInfo, gitSecret, workspaceClaim)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -143,26 +156,26 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Update status with new PipelineRun info
+	// Update Workload status
 	wl.Status.LastPipelineRun = pr.Name
-	r.updateStatusCondition(ctx, &wl, metav1.ConditionTrue, "Reconciled",
+	wl.Status.ObservedGeneration = wl.Generation
+	r.updateStatusCondition(ctx, wl, metav1.ConditionTrue, "Reconciled",
 		fmt.Sprintf("PipelineRun %s created with SHA %s", pr.Name, sha))
 
-	return ctrl.Result{}, r.Status().Update(ctx, &wl)
+	return ctrl.Result{}, r.Status().Update(ctx, wl)
 }
 
 func (r *WorkloadReconciler) syncPipelineRunStatus(ctx context.Context, wl *tektonv1alpha1.Workload) error {
 	var prList pipelinev1beta1.PipelineRunList
-	if err := r.List(ctx, &prList, client.InNamespace(wl.Namespace)); err != nil {
+	if err := r.List(ctx, &prList, client.InNamespace(wl.Namespace),
+		client.MatchingLabels{"workload": wl.Name}); err != nil {
 		return err
 	}
 
 	var latestPR *pipelinev1beta1.PipelineRun
 	for i, pr := range prList.Items {
-		if pr.Labels["workload"] == wl.Name {
-			if latestPR == nil || pr.CreationTimestamp.After(latestPR.CreationTimestamp.Time) {
-				latestPR = &prList.Items[i]
-			}
+		if latestPR == nil || pr.CreationTimestamp.After(latestPR.CreationTimestamp.Time) {
+			latestPR = &prList.Items[i]
 		}
 	}
 
@@ -234,5 +247,6 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tektonv1alpha1.Workload{}).
 		Owns(&pipelinev1beta1.PipelineRun{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}). // 동시성 제한
 		Complete(r)
 }
