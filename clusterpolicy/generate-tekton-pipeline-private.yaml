@@ -206,7 +206,7 @@ spec:
                   - name: source
                     workspace: shared-data
 
-              - name: build-default-with-nexus-for-buildpacks
+              - name: build-default-for-buildpacks
                 runAfter:
                   - fetch-source
                 when:
@@ -227,19 +227,17 @@ spec:
                     value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
                   - name: BUILDER_IMAGE
                     value: gcr.io/buildpacks/builder:v1
-                  - name: CACHE_IMAGE
-                    value: '\$(params.cache_image_url)'
+                  #- name: CACHE_IMAGE
+                  #  value: '\$(params.cache_image_url)'
                   - name: ENV_VARS
-                    value:
-                      - BP_MAVEN_SETTINGS_PATH=/workspace/settings-xml/settings.xml
-                      - BP_LOG_LEVEL=DEBUG
+                    value: '\$(params.build_env_name[*])'
                 workspaces:
                   - name: source
                     workspace: shared-data
                   - name: settings-xml
                     workspace: settings-xml
 
-              - name: build-base-with-nexus-for-buildpacks
+              - name: build-base-for-buildpacks
                 runAfter:
                   - fetch-source
                 when:
@@ -272,7 +270,7 @@ spec:
                   - name: settings-xml
                     workspace: settings-xml
 
-              - name: build-full-with-nexus-for-buildpacks
+              - name: build-full-for-buildpacks
                 runAfter:
                   - fetch-source
                 when:
@@ -293,108 +291,22 @@ spec:
                     value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
                   - name: BUILDER_IMAGE
                     value: paketobuildpacks/builder:full
-                  - name: CACHE_IMAGE
-                    value: '\$(params.cache_image_url)'
+                  #- name: CACHE_IMAGE
+                  #  value: '\$(params.cache_image_url)'
                   - name: ENV_VARS
-                    value:
-                      - BP_MAVEN_SETTINGS_PATH=/workspace/settings-xml/settings.xml
-                      - BP_LOG_LEVEL=DEBUG
+                    value: '\$(params.build_env_name[*])'
                 workspaces:
                   - name: source
                     workspace: shared-data
                   - name: settings-xml
                     workspace: settings-xml
 
-              - name: build-default-without-nexus-for-buildpacks
-                runAfter:
-                  - fetch-source
-                when:
-                  - input: '\$(params.dockerfile)'
-                    operator: notin
-                    values: ["./Dockerfile"]
-                  - input: '\$(params.buildServiceBindings)'
-                    operator: in
-                    values: ["false"]
-                  - input: '\$(params.clusterBuilder)'
-                    operator: in
-                    values: ["default"]
-                taskRef:
-                  name: buildpacks
-                  kind: Task
-                params:
-                  - name: APP_IMAGE
-                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
-                  - name: BUILDER_IMAGE
-                    value: gcr.io/buildpacks/builder:v1
-                  - name: CACHE_IMAGE
-                    value: '\$(params.cache_image_url)'
-                workspaces:
-                  - name: source
-                    workspace: shared-data
-
-              - name: build-base-without-nexus-for-buildpacks
-                runAfter:
-                  - fetch-source
-                when:
-                  - input: '\$(params.dockerfile)'
-                    operator: notin
-                    values: ["./Dockerfile"]
-                  - input: '\$(params.buildServiceBindings)'
-                    operator: in
-                    values: ["false"]
-                  - input: '\$(params.clusterBuilder)'
-                    operator: in
-                    values: ["base"]
-                taskRef:
-                  name: buildpacks
-                  kind: Task
-                params:
-                  - name: APP_IMAGE
-                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
-                  - name: BUILDER_IMAGE
-                    value: paketobuildpacks/builder:base
-                  - name: CACHE_IMAGE
-                    value: '\$(params.cache_image_url)'
-                workspaces:
-                  - name: source
-                    workspace: shared-data
-
-              - name: build-full-without-nexus-for-buildpacks
-                runAfter:
-                  - fetch-source
-                when:
-                  - input: '\$(params.dockerfile)'
-                    operator: notin
-                    values: ["./Dockerfile"]
-                  - input: '\$(params.buildServiceBindings)'
-                    operator: in
-                    values: ["false"]
-                  - input: '\$(params.clusterBuilder)'
-                    operator: in
-                    values: ["full"]
-                taskRef:
-                  name: buildpacks
-                  kind: Task
-                params:
-                  - name: APP_IMAGE
-                    value: '\$(params.image_repo_address)/\$(params.image_repo_path)/\$(params.workloadname):\$(params.ci-git-revision)'
-                  - name: BUILDER_IMAGE
-                    value: paketobuildpacks/builder:full
-                  - name: CACHE_IMAGE
-                    value: '\$(params.cache_image_url)'
-                workspaces:
-                  - name: source
-                    workspace: shared-data
-
               - name: generate-manifest
                 runAfter:
                   - build-with-buildkit
-                  - build-default-with-nexus-for-buildpacks
-                  - build-base-with-nexus-for-buildpacks
-                  - build-full-with-nexus-for-buildpacks
-                  - build-default-without-nexus-for-buildpacks
-                  - build-base-without-nexus-for-buildpacks
-                  - build-full-without-nexus-for-buildpacks
+                  - build-default-for-buildpacks
+                  - build-base-for-buildpacks
+                  - build-full-for-buildpacks
                 taskRef:
                   name: generate-manifest
                   kind: Task
